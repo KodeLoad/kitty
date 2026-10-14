@@ -226,6 +226,120 @@ class TestFileTransmission(BaseTest):
     def test_rsync_roundtrip(self):
         test_rsync_roundtrip(self)
 
+    def test_rsync_invalid_block_size(self):
+        from kittens.transfer.rsync import RsyncError
+
+        for block_size in (0, 1024 * 1024 + 1):
+            d = Differ()
+            with self.assertRaises(RsyncError):
+                d.add_signature_data(bytes(8) + block_size.to_bytes(4, 'little'))
+
+    def test_file_put_differential(self):
+        from kitty.file_transmission import PatchFile
+
+        def start_receiving():
+            ft = FileTransmission()
+            ft.handle_serialized_command(serialized_cmd(action='send'))
+            ft.test_responses = []
+            return ft
+
+        def started_ttype(ft):
+            q = [r for r in ft.test_responses if r.get('status') == 'STARTED']
+            self.ae(len(q), 1)
+            return q[0].get('ttype', 'simple')
+
+        def signature_sent(ft):
+            return b''.join(r['data'] for r in ft.test_responses if r.get('action') == 'data' and r.get('data'))
+
+        base = os.path.join(self.tdir, 'diff')
+        os.mkdir(base)
+
+        # a differential transfer to a plain regular file works as usual
+        dest = os.path.join(base, 'f.bin')
+        before = b'hello world ' * 5000
+        after = (b'hello world ' * 4000) + (b'goodbye!' * 2000)
+        with open(dest, 'wb') as f:
+            f.write(before)
+        ft = start_receiving()
+        ft.handle_serialized_command(serialized_cmd(action='file', file_id='r', name=dest, ftype='regular', ttype='rsync'))
+        self.ae(started_ttype(ft), 'rsync')
+        d = Differ()
+        d.add_signature_data(signature_sent(ft))
+        d.finish_signature_data()
+        src = memoryview(after)
+        delta = bytearray()
+
+        def read_into(b):
+            nonlocal src
+            n = min(len(b), len(src))
+            b[:n] = src[:n]
+            src = src[n:]
+            return n
+
+        while d.next_op(read_into, delta.extend):
+            pass
+        chunks = memoryview(bytes(delta))
+        while len(chunks) > 4096:
+            ft.handle_serialized_command(serialized_cmd(action='data', file_id='r', data=bytes(chunks[:4096])))
+            chunks = chunks[4096:]
+        ft.handle_serialized_command(serialized_cmd(action='end_data', file_id='r', data=bytes(chunks)))
+        with open(dest, 'rb') as f:
+            self.ae(f.read(), after)
+        self.ae(sorted(names_in(base)), ['f.bin'])
+
+        # a sender must not be able to use a differential transfer to read
+        # through a symlink it plants at the destination in the same transfer
+        secret_dir = os.path.join(base, 'secret')
+        os.mkdir(secret_dir)
+        secret = os.path.join(secret_dir, 'secret.txt')
+        secret_data = b'super secret data' * 1000
+        with open(secret, 'wb') as f:
+            f.write(secret_data)
+        sdest = os.path.join(base, 'innocent.bin')
+        ft = start_receiving()
+        ft.handle_serialized_command(serialized_cmd(action='file', file_id='s', name=sdest, ftype='symlink'))
+        ft.handle_serialized_command(serialized_cmd(action='end_data', file_id='s', data='path:' + secret))
+        self.assertTrue(os.path.islink(sdest))
+        ft.test_responses = []
+        ft.handle_serialized_command(serialized_cmd(action='file', file_id='r', name=sdest, ftype='regular', ttype='rsync'))
+        self.ae(started_ttype(ft), 'simple')
+        self.ae(signature_sent(ft), b'')
+        ft.handle_serialized_command(serialized_cmd(action='end_data', file_id='r', data='replacement'))
+        self.assertFalse(os.path.islink(sdest))
+        with open(sdest, 'rb') as f:
+            self.ae(f.read(), b'replacement')
+        with open(secret, 'rb') as f:
+            self.ae(f.read(), secret_data)
+        self.ae(sorted(names_in(secret_dir)), ['secret.txt'])
+
+        # likewise for a destination with more than one link to it
+        hdest = os.path.join(base, 'hard.bin')
+        other = os.path.join(base, 'other.bin')
+        with open(hdest, 'wb') as f:
+            f.write(b'original')
+        os.link(hdest, other)
+        ft = start_receiving()
+        ft.handle_serialized_command(serialized_cmd(action='file', file_id='r', name=hdest, ftype='regular', ttype='rsync'))
+        self.ae(started_ttype(ft), 'simple')
+        self.ae(signature_sent(ft), b'')
+        ft.handle_serialized_command(serialized_cmd(action='end_data', file_id='r', data='replacement'))
+        with open(other, 'rb') as f:
+            self.ae(f.read(), b'original')
+
+        # and PatchFile itself must never follow a symlink, in case the
+        # destination is swapped after it is created but before it is read
+        pf = PatchFile(sdest, len(secret_data))
+        os.remove(sdest)
+        os.symlink(secret, sdest)
+        with self.assertRaises(OSError):
+            pf.next_signature_block(memoryview(bytearray(64)))
+        # its temporary file goes next to the destination, not next to the
+        # symlink target
+        tf = pf.dest_file
+        tf.close()
+        self.assertPathEqual(os.path.dirname(tf.name), base)
+        os.remove(tf.name)
+
     def test_file_get(self):
         # send refusal
         for quiet in (0, 1, 2):
@@ -302,6 +416,38 @@ class TestFileTransmission(BaseTest):
             ft.handle_serialized_command(serialized_cmd(action='file', file_id='sl', name=sl, compression=compress))
             received = b''.join(x['data'] for x in ft.test_responses)
             self.ae(received.decode('utf-8'), src)
+
+    def test_check_bypass(self):
+        import json
+        from base64 import b85encode
+        from time import time_ns
+        from types import SimpleNamespace
+        from unittest.mock import patch
+
+        from kitty.fast_data_types import AES256GCMEncrypt, EllipticCurveKey
+        from kitty.file_transmission import check_bypass, encode_bypass
+
+        from .crypto import is_rlimit_memlock_too_low
+
+        if is_rlimit_memlock_too_low():
+            self.skipTest('RLIMIT_MEMLOCK is too low')
+        kitty_key, remote_key = EllipticCurveKey(), EllipticCurveKey()
+
+        def kitty_1(request_id: str, password: str) -> str:
+            e = AES256GCMEncrypt(remote_key.derive_secret(kitty_key.public))
+            encrypted = e.add_data_to_be_encrypted(f'{time_ns()}:{request_id};{password}'.encode(), True)
+            return 'kitty-1:' + json.dumps(
+                {k: b85encode(v).decode() for k, v in {'pubkey': remote_key.public, 'iv': e.iv, 'tag': e.tag, 'encrypted': encrypted}.items()}
+            )
+
+        with patch('kitty.file_transmission.get_boss', return_value=SimpleNamespace(encryption_key=kitty_key)):
+            self.assertTrue(check_bypass('secret', 'rid', kitty_1('rid', 'secret')))
+            self.assertFalse(check_bypass('secret', 'rid', kitty_1('rid', 'wrong')))
+            self.assertFalse(check_bypass('secret', 'rid', kitty_1('other', 'secret')))
+            self.assertTrue(check_bypass('secret', 'rid', encode_bypass('rid', 'secret')))
+            # when no bypass password is configured, bypass must never succeed
+            self.assertFalse(check_bypass('', 'rid', kitty_1('rid', '')))
+            self.assertFalse(check_bypass('', 'rid', encode_bypass('rid', '')))
 
     def test_parse_ftc(self):
         def t(raw, *expected):

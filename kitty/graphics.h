@@ -19,7 +19,7 @@ typedef struct {
         uint32_t cursor_movement, compose_mode;
     };
     union {
-        uint32_t cell_x_offset;
+        uint32_t cell_x_offset, blend_mode;
     };
     union {
         uint32_t cell_y_offset, bgcolor;
@@ -114,7 +114,7 @@ typedef struct {
     bool root_frame_data_loaded;
     id_type ref_id_counter;
     Frame *extra_frames, root_frame;
-    uint32_t current_frame_index, frame_id_counter;
+    uint32_t current_frame_index, frame_id_counter, displayed_frame_id;
     uint64_t animation_duration;
     size_t extra_framecnt;
     monotonic_t atime;
@@ -134,9 +134,6 @@ typedef struct {
 typedef struct {
     uint8_t *buf;
     size_t buf_capacity, buf_used;
-
-    uint8_t *mapped_file;
-    size_t mapped_file_sz;
 
     size_t data_sz;
     uint8_t *data;
@@ -183,6 +180,8 @@ typedef struct {
     int32_t amt, limit;
     index_type margin_top, margin_bottom;
     bool has_margins;
+    // The history scrolls with the screen: lines move into it (amt < 0) or are popped back from it (amt > 0)
+    bool scroll_history;
 } ScrollData;
 
 

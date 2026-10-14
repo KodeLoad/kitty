@@ -13,6 +13,7 @@ from kitty.fast_data_types import (
     has_avx2,
     has_avx512,
     has_sse4_2,
+    test_blend_pixels,
     test_find_either_of_two_bytes,
     test_printable_ascii_run_length,
     test_utf8_decode_to_sentinel,
@@ -158,6 +159,11 @@ class TestParser(BaseTest):
             self.ae(base64_decode(src.encode()), expected.encode(), f'Decoding of {src} failed')
             self.ae(base64_decode(src.replace('=', '').encode()), expected.encode(), f'Decoding of {src} failed')
             self.ae(base64_encode(expected.encode()), src.replace('=', '').encode(), f'Encoding of {expected} failed')
+            self.ae(base64_decode(src.encode(), True), expected.encode(), f'Strict decoding of {src} failed')
+        # in strict mode characters outside the base64 alphabet and missing padding are rejected
+        for invalid in ('bGlnaHQgdw=', 'bGlnaHQgdw', 'bGln!!Qgdw==', 'bGlnaHQgdw==\n', '!!!!', 'bGl'):
+            self.assertRaises(ValueError, base64_decode, invalid.encode(), True)
+        self.ae(base64_decode(b'', True), b'')
 
     def test_simple_parsing(self):
         s = self.create_screen()
@@ -831,6 +837,42 @@ class TestParser(BaseTest):
                     data = base + base_data[:extra]
                     t(key, data, align_offset)
 
+    def test_blend_pixels(self):
+        rng = random.Random(0x1B7F5)
+        impls = []
+        if has_sse4_2:
+            impls.append(2)
+        if has_avx2:
+            impls.append(3)
+        if has_avx512:
+            impls.append(4)
+        impls.append(0)
+
+        def t(kind, dst, src, color=0xFFFFFF, align_offsets=(0, 1, 2, 3, 7, 13)):
+            expected = test_blend_pixels(kind, dst, src, 1, color, 0)
+            for which_function in impls:
+                for align_offset in align_offsets:
+                    actual = test_blend_pixels(kind, dst, src, which_function, color, align_offset)
+                    self.ae(expected, actual, f'{kind=} {which_function=} {align_offset=} num_pixels={len(src) // 4}')
+
+        for num_pixels in (0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 15, 16, 17, 31, 32, 33, 63, 64, 65, 255, 256, 257):
+            src = bytearray(rng.getrandbits(8) for _ in range(4 * num_pixels))
+            # ensure fully transparent and fully opaque source pixels are well represented
+            for i in range(num_pixels):
+                if i % 5 == 0:
+                    src[4 * i + 3] = 0
+                elif i % 5 == 1:
+                    src[4 * i + 3] = 255
+            src = bytes(src)
+            dst4 = bytes(rng.getrandbits(8) for _ in range(4 * num_pixels))
+            dst3 = bytes(rng.getrandbits(8) for _ in range(3 * num_pixels))
+            mask = bytes(rng.getrandbits(8) for _ in range(num_pixels))
+            t('straight', dst4, src)
+            t('opaque', dst4, src)
+            t('opaque3', dst3, src)
+            # keep the destination pixels 4-byte aligned for the mask variant
+            t('mask', dst4, mask, color=0x123456, align_offsets=(0, 4, 12, 36))
+
     def test_esc_codes(self):
         s = self.create_screen()
         pb = partial(self.parse_bytes_dump, s)
@@ -971,6 +1013,22 @@ class TestParser(BaseTest):
         self.ae(c.wtcbuf, b'\x1b[?2033;1$y')
         pb('\033[?2033l', ('screen_reset_mode', 2033, 1))
 
+    def test_malformed_csi_subparam_does_not_corrupt_sgr(self):
+        # Regression for #10434: \e[?:m sets is_sub_param[0]=true in the CSI
+        # state. reset_csi must clear that flag so the next SGR isn't rejected.
+        s = self.create_screen()
+        parse_bytes(s, b'\033[?:m\033[31m')
+        self.ae(s.cursor.fg, 1 << 8 | 1)  # red (ANSI color 1)
+
+    def test_csi_separator_after_max_params(self):
+        # A ':' or ';' immediately after the last allowed CSI parameter must
+        # not write past the end of is_sub_param
+        s = self.create_screen()
+        pb = partial(self.parse_bytes_dump, s)
+        too_many = ('CSI escape code has too many parameters, ignoring it',)
+        pb('\033[' + '1;' * 255 + '1:2m\033[31m', too_many, ('select_graphic_rendition', '31'))
+        pb('\033[' + '1;' * 256 + 'm\033[31m', ('select_graphic_rendition', ';'.join('1' * 256)), ('select_graphic_rendition', '31'))
+
     def test_csi_code_rep(self):
         s = self.create_screen(8)
         pb = partial(self.parse_bytes_dump, s)
@@ -1029,6 +1087,10 @@ class TestParser(BaseTest):
         pb('\033]52;p;xyz\x07', ('clipboard_control', 52, 'p;xyz'))
         c.clear()
         pb('\033]22;?__current__\x07', ('set_dynamic_color', 22, '?__current__'))
+        c.clear()
+        pb('\033]7501;?\033\\', ('program_status_report', '?'))
+        pb('\033]7501;state=working:progress=40\x07', ('program_status_report', 'state=working:progress=40'))
+        self.ae(c.program_status_reports, ['?', 'state=working:progress=40'])
 
     def test_dcs_codes(self):
         s = self.create_screen()
@@ -1053,6 +1115,12 @@ class TestParser(BaseTest):
         c.clear()
         pb('\033P$qr\033\\', ('screen_request_capabilities', ord('$'), 'r'))
         self.ae(c.wtcbuf, f'\033P1$r{s.margin_top + 1};{s.margin_bottom + 1}r\033\\'.encode('ascii'))
+        c.clear()
+        # Invalid DECRQSS queries must not be echoed back (CVE-2008-2383)
+        malicious_query = 'm\033[6n'
+        pb(f'\033P$q{malicious_query}\033\\', ('screen_request_capabilities', ord('$'), malicious_query))
+        self.ae(c.wtcbuf, b'\033P0$r\033\\')
+        self.assertNotIn(malicious_query.encode('ascii'), c.wtcbuf)
         pb('\033P@kitty-cmd{abc\033\\', ('handle_remote_cmd', '{abc'))
         p = base64_encode('abcd').decode()
         pb(f'\033P@kitty-print|{p}\033\\', ('handle_remote_print', p))
@@ -1163,3 +1231,16 @@ class TestParser(BaseTest):
             line = s.line(y)
             for x in range(s.columns):
                 self.ae(line.cursor_from(x).fg, (10 << 8 | 1) if x < 1 or x > 2 else (4 << 8) | 1)
+        # out of range or inverted single line regions must not touch anything
+        before = [[s.line(y).cursor_from(x).bold for x in range(s.columns)] for y in range(s.lines)]
+        for seq in ('\033[100;1;100;5;22$r', '\033[99999999;1;99999999;5;22$r', '\033[10;20;10;2;22$r', '\033[3;4;3;2;22$r'):
+            parse_bytes(s, seq.encode())
+            after = [[s.line(y).cursor_from(x).bold for x in range(s.columns)] for y in range(s.lines)]
+            self.ae(before, after, seq)
+
+    def test_cht_large_count(self):
+        s = self.create_screen(cols=80)
+        parse_bytes(s, b'\033[3I')
+        self.ae(s.cursor.x, 24)
+        parse_bytes(s, b'\033[2147483647I')
+        self.ae(s.cursor.x, s.columns - 1)

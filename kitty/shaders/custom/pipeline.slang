@@ -61,16 +61,54 @@ linear2srgb(float3 x) { // vector
 
 uniform Sampler2D backbuffer, a, b, persist;
 
+// The size of the pointer map grid, POINTER_MAP_SIZE is defined by kitty from state.h when compiling
+static const float pointer_map_size = POINTER_MAP_SIZE;
+
+// Where the content visible at pos actually is, as decided by the pointer_map()
+// functions of the shaders that move content around
+float2
+pipeline_pointer_map(float2 pos) {
+    // POINTER_MAP
+    return pos;
+}
+
+// Rendered when group is negative, to compute the pointer map. Each coordinate
+// is split over two 8 bit channels so that it is precise even on GPU drivers
+// that cannot render to 16 bit textures.
+float4
+encode_pointer_map(float2 texel_pos) {
+    // Spread the texels so that the first and last ones land exactly on the edges
+    float2 pos = (texel_pos * pointer_map_size - 0.5f) / (pointer_map_size - 1.f);
+    float2 q = round(saturate(pipeline_pointer_map(pos)) * 65535.f);
+    float2 hi = floor(q / 256.f);
+    return float4(hi / 255.f, (q - hi * 256.f) / 255.f);
+}
+
 public float4
 pipeline_fragment_main(float2 backbuffer_pos, int group, float4 viewport, float animation_progress, bool convert_to_srgb) {
     float4 color = backbuffer.Sample(backbuffer_pos); // pre multiplied linear RGB
     color = float4(color.rgb / color.a, color.a);     // un pre multiplied color passed through pipeline
     // src_rect encodes (0, sy, sx, 0) — the fraction of the shared texture occupied by the current
-    // viewport. Normalize backbuffer_pos so that t.pos is always in [0,1] viewport UV regardless of
-    // whether the shared texture is larger than the current viewport (e.g. after a window shrink).
+    // viewport. The shared texture is grown to fit the largest OS Window viewport and never
+    // shrunk, so sx/sy are less than one whenever this window is smaller than that. Normalize
+    // backbuffer_pos so that t.pos is always in [0,1] viewport UV and wrap the samplers so that
+    // shaders can address them in that same space, regardless of the size of the shared texture.
     float2 src_scale = float2(max(1e-6, csd.src_rect[right]), max(1e-6, csd.src_rect[top]));
     float2 viewport_pos = backbuffer_pos / src_scale;
-    KittyTextures t = { backbuffer, a, b, persist, viewport_pos, viewport, animation_progress, group };
+    if (group < 0) return encode_pointer_map(viewport_pos);
+    // Half a texel inset, in viewport UV, so that clamped samples do not bilinearly blend in the
+    // stale texels that lie just outside the viewport region of the shared texture.
+    float2 max_pos = 1.f - 0.5f / max(float2(csd.viewport_size_pixels), float2(1.f));
+    KittyTextures t = {
+        { backbuffer, src_scale, max_pos },
+        { a, src_scale, max_pos },
+        { b, src_scale, max_pos },
+        { persist, src_scale, max_pos },
+        viewport_pos,
+        viewport,
+        animation_progress,
+        group
+    };
     // PIPELINE
     return vec4_premul(color.rgb, color.a);
 }

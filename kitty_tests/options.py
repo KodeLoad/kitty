@@ -8,7 +8,7 @@ import tempfile
 
 from kitty.constants import kitty_exe
 from kitty.fast_data_types import Color, test_cursor_blink_easing_function
-from kitty.options.utils import DELETE_ENV_VAR, EasingFunction, to_color
+from kitty.options.utils import DELETE_ENV_VAR, EasingFunction, build_action_aliases, to_color
 from kitty.utils import log_error, shlex_split
 
 from .base import BaseTest
@@ -34,6 +34,98 @@ class TestConfParsing(BaseTest):
 
     def test_cli_parsing(self):
         cli_parsing(self)
+
+    def test_font_size_clamping(self):
+        font_size_clamping(self)
+
+    def test_session_launch_option_expansion(self) -> None:
+        from kitty.launch import LaunchSpec
+        from kitty.options.types import defaults
+        from kitty.session import parse_session
+
+        for command in (
+            '--title bash --cwd $SESSION_DIR bash $COMMAND_ARG',
+            '--title=bash --cwd=$SESSION_DIR bash $COMMAND_ARG',
+            '--title bash --cwd $SESSION_DIR -- bash $COMMAND_ARG',
+            '--title other --cwd $SESSION_DIR bash $COMMAND_ARG',
+        ):
+            with self.subTest(command=command):
+                (session,) = parse_session(f'launch {command}', defaults, environ={'SESSION_DIR': '/tmp/session', 'COMMAND_ARG': 'expanded'})
+                spec = session.tabs[0].windows[0].launch_spec
+                assert isinstance(spec, LaunchSpec)
+                self.ae(spec.opts.cwd, '/tmp/session')
+                self.ae(spec.args, ['bash', '$COMMAND_ARG'])
+
+    def test_session_discovery(self):
+        from unittest.mock import patch
+
+        from kitty.config import load_config
+        from kitty.constants import config_dir
+        from kitty.fast_data_types import set_options
+        from kitty.session import get_all_known_sessions, seen_session_paths
+
+        def discover(*lines):
+            bad_lines = []
+            opts = load_config(overrides=('clear_all_shortcuts yes', *lines), accumulate_bad_lines=bad_lines)
+            self.assertFalse(bad_lines)
+            set_options(opts)
+            return get_all_known_sessions()
+
+        with patch.dict(seen_session_paths, {}, clear=True):
+            for args, name in (
+                ('work.kitty-session', 'work'),
+                ('--sort-by alphabetical work.kitty-session', 'work'),
+                ('--sort-by=alphabetical work.kitty-session', 'work'),
+                ('--active-only=no --sort-by recent work.kitty-session', 'work'),
+                ('work.kitty-session --sort-by alphabetical', 'work'),
+                ('-- "-work project.kitty-session"', '-work project'),
+                ('-- -0', '-0'),
+                ('', ''),
+                ('--sort-by alphabetical', ''),
+                ('--sort-by=alphabetical', ''),
+                ('--active-only', ''),
+                ('-1', ''),
+                ('-- -1', ''),
+                ('--sort-by alphabetical -- -2', ''),
+                ('--sort-by', ''),
+                ('--sort-by invalid work.kitty-session', ''),
+                ('--unknown work.kitty-session', ''),
+                ('--active-only=invalid work.kitty-session', ''),
+            ):
+                with self.subTest(args=args):
+                    filename = f'{name}.kitty-session' if name != '-0' else name
+                    expected = {name: os.path.join(config_dir, filename)} if name else {}
+                    self.ae(discover(f'map f7 goto_session {args}'), expected)
+
+            seen_path = os.path.join(self.tdir, 'work.kitty-session')
+            seen_session_paths['work'] = seen_path
+            self.ae(
+                discover(
+                    'action_alias project goto_session --sort-by alphabetical',
+                    'map f7 project work.kitty-session',
+                    'map f8 combine : goto_session --sort-by : project other.kitty-session',
+                ),
+                {'work': seen_path, 'other': os.path.join(config_dir, 'other.kitty-session')},
+            )
+
+    def test_launch_transparent_color_overrides(self) -> None:
+        from kitty.launch import apply_colors
+        from kitty.window import Window
+
+        cases = (
+            (('transparent_background_colors=#ffffff@0.5', 'foreground=red'), ((Color(255, 255, 255), 0.5),)),
+            (('foreground=red', 'transparent_background_colors=#ffffff@0.5'), ((Color(255, 255, 255), 0.5),)),
+            (('transparent_background_colors=#ffffff@0.5', 'foreground=red', 'transparent_background_colors='), ()),
+            (('transparent_background_colors=#ffffff@0.5', 'transparent_background_colors=#000000@0.25', 'foreground=red'), ((Color(0, 0, 0), 0.25),)),
+        )
+        for colors, expected in cases:
+            with self.subTest(colors=colors):
+                window = Window.__new__(Window)
+                window.screen = self.create_screen()
+                apply_colors(window, colors)
+                actual = window.screen.color_profile.as_dict()
+                self.ae(actual.get('transparent_background_colors', ()), expected)
+                self.ae(actual['foreground'], 0xFF0000)
 
 
 def cli_parsing(self):
@@ -122,6 +214,32 @@ version
     t('-1 -v0', fails=True, version_called=True)
     t('-1 --version', fails=True, version_called=True)
     t('-f=3.142 --int 17', float=3.142, int=17)
+
+
+def font_size_clamping(self: 'BaseTest') -> None:
+    from kitty.options.utils import MAXIMUM_FONT_SIZE, MINIMUM_FONT_SIZE, clamp_font_size
+
+    # the floor applies whatever the configured size
+    self.ae(clamp_font_size(0, 11), MINIMUM_FONT_SIZE)
+    self.ae(clamp_font_size(-100, 11), MINIMUM_FONT_SIZE)
+
+    # sizes inside the range come back untouched
+    self.ae(clamp_font_size(11, 11), 11)
+    self.ae(clamp_font_size(64, 11), 64)
+
+    # the ceiling is the larger of the multiple and the absolute maximum, so a
+    # small configured size no longer implies a small maximum zoom
+    self.ae(clamp_font_size(1e6, 4), MAXIMUM_FONT_SIZE)
+    self.ae(clamp_font_size(1e6, 11), MAXIMUM_FONT_SIZE)
+    self.ae(clamp_font_size(200, 4), 200)
+
+    # a large configured size keeps its proportional ceiling
+    self.ae(clamp_font_size(1e6, 40), 400)
+    self.ae(clamp_font_size(1e6, 100), 1000)
+
+    # and the ceiling is never below the absolute maximum
+    for configured in (1, 4, 11, 25.6, 40, 100):
+        self.assertGreaterEqual(clamp_font_size(1e6, configured), MAXIMUM_FONT_SIZE)
 
 
 def launcher(self):
@@ -255,6 +373,10 @@ def conf_parsing(self):
 
     opts = p('font_size 11.37', 'clear_all_shortcuts y', 'color23 red')
     self.ae(opts.font_size, 11.37)
+    radius_opts = p('window_border_radius 7px')
+    self.ae(radius_opts.window_border_radius, (7.0, 'px'))
+    radius_opts = p('window_border_radius -2')
+    self.ae(radius_opts.window_border_radius, (0.0, 'pt'))
     self.ae(opts.mouse_hide_wait[0], 0 if is_macos else 3)
     self.ae(opts.mouse_hide_wait[1], 0)
     self.ae(opts.mouse_hide_wait[2], 40)
@@ -281,6 +403,15 @@ def conf_parsing(self):
     self.ae(len(opts.keyboard_modes[''].keymap), 1)
     opts = p('clear_all_mouse_actions y', 'mouse_map left click ungrabbed mouse_click_url_or_select')
     self.ae(len(opts.mousemap), 1)
+    opts = p(
+        'clear_all_mouse_actions y',
+        'mouse_map ctrl+wheel_up press ungrabbed,grabbed change_font_size all +1',
+        'mouse_map shift+wheel_right press ungrabbed next_tab',
+    )
+    self.ae(
+        {k.human_repr() for k in opts.mousemap},
+        {'ctrl+wheel_up press ungrabbed', 'ctrl+wheel_up press grabbed', 'shift+wheel_right press ungrabbed'},
+    )
     opts = p('strip_trailing_spaces always')
     self.ae(opts.strip_trailing_spaces, 'always')
     self.assertFalse(bad_lines)
@@ -348,6 +479,11 @@ def conf_parsing(self):
 
     opts = p('clear_all_shortcuts y', 'action_alias ss kitten "space 1"', 'map f1 ss "space 2"')
     self.ae(ac().args, ('space 1', 'space 2'))
+
+    am = build_action_aliases({'la': 'launch --moo'})
+    self.ae(am.resolve_aliases('la XXX')[0].args, ('--moo', 'XXX'))
+    am.update(build_action_aliases({'la': 'launch --baa'}))
+    self.ae(am.resolve_aliases('la XXX')[0].args, ('--baa', 'XXX'))
 
     opts = p('kitty_mod alt')
     self.ae(opts.kitty_mod, to_modifiers('alt'))

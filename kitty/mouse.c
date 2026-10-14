@@ -203,6 +203,13 @@ set_currently_hovered_window(id_type window_id, int modifiers, bool focus_follow
     }
 }
 
+// Pseudo buttons so that the scroll wheel can be mapped with mouse_map. For
+// these, count is the number of wheel steps, which is always positive.
+#define MOUSE_WHEEL_UP (GLFW_MOUSE_BUTTON_LAST + 1)
+#define MOUSE_WHEEL_DOWN (GLFW_MOUSE_BUTTON_LAST + 2)
+#define MOUSE_WHEEL_LEFT (GLFW_MOUSE_BUTTON_LAST + 3)
+#define MOUSE_WHEEL_RIGHT (GLFW_MOUSE_BUTTON_LAST + 4)
+
 static bool
 dispatch_mouse_event(Window *w, int button, int count, int modifiers, bool grabbed) {
     bool handled = false;
@@ -226,14 +233,15 @@ dispatch_mouse_event(Window *w, int button, int count, int modifiers, bool grabb
         }
         if (OPT(debug_keyboard)) {
             const char *evname = "move";
-            switch (count) {
-                case -3: evname = "doubleclick"; break;
-                case -2: evname = "click"; break;
-                case -1: evname = "release"; break;
-                case 1: evname = "press"; break;
-                case 2: evname = "doublepress"; break;
-                case 3: evname = "triplepress"; break;
-            }
+            if (button > GLFW_MOUSE_BUTTON_LAST) evname = "press";
+            else switch (count) {
+                    case -3: evname = "doubleclick"; break;
+                    case -2: evname = "click"; break;
+                    case -1: evname = "release"; break;
+                    case 1: evname = "press"; break;
+                    case 2: evname = "doublepress"; break;
+                    case 3: evname = "triplepress"; break;
+                }
             const char *bname = "unknown";
             switch (button) {
                 case GLFW_MOUSE_BUTTON_LEFT: bname = "left"; break;
@@ -244,6 +252,10 @@ dispatch_mouse_event(Window *w, int button, int count, int modifiers, bool grabb
                 case GLFW_MOUSE_BUTTON_6: bname = "b6"; break;
                 case GLFW_MOUSE_BUTTON_7: bname = "b7"; break;
                 case GLFW_MOUSE_BUTTON_8: bname = "b8"; break;
+                case MOUSE_WHEEL_UP: bname = "wheel_up"; break;
+                case MOUSE_WHEEL_DOWN: bname = "wheel_down"; break;
+                case MOUSE_WHEEL_LEFT: bname = "wheel_left"; break;
+                case MOUSE_WHEEL_RIGHT: bname = "wheel_right"; break;
             }
             debug("\x1b[33mon_mouse_input\x1b[m: %s button: %s %sgrabbed: %d handled_in_kitty: %d\n", evname, bname, format_mods(modifiers), grabbed, handled);
         }
@@ -253,22 +265,22 @@ dispatch_mouse_event(Window *w, int button, int count, int modifiers, bool grabb
 
 static unsigned int
 window_left(Window *w) {
-    return w->render_data.geometry.left - w->padding.left;
+    return w->render_data.geometry.left - w->padding.left - w->size_mismatch_padding.left;
 }
 
 static unsigned int
 window_right(Window *w) {
-    return w->render_data.geometry.right + w->padding.right;
+    return w->render_data.geometry.right + w->padding.right + w->size_mismatch_padding.right;
 }
 
 static unsigned int
 window_top(Window *w) {
-    return w->render_data.geometry.top - w->padding.top;
+    return w->render_data.geometry.top - w->padding.top - w->size_mismatch_padding.top;
 }
 
 static unsigned int
 window_bottom(Window *w) {
-    return w->render_data.geometry.bottom + w->padding.bottom;
+    return w->render_data.geometry.bottom + w->padding.bottom + w->size_mismatch_padding.bottom;
 }
 
 static bool
@@ -289,14 +301,6 @@ border_contains_mouse(BorderRect *br, double tolerance, Edge *edges) {
     return ans;
 }
 
-
-static double
-distance_to_window(Window *w) {
-    double x = global_state.callback_os_window->mouse_x, y = global_state.callback_os_window->mouse_y;
-    double cx = (window_left(w) + window_right(w)) / 2.0;
-    double cy = (window_top(w) + window_bottom(w)) / 2.0;
-    return (x - cx) * (x - cx) + (y - cy) * (y - cy);
-}
 
 static bool clamp_to_window = false;
 
@@ -547,6 +551,12 @@ end_drag(Window *w) {
     global_state.active_drag_button = -1;
     w->last_drag_scroll_at = 0;
     w->scrollbar.is_dragging = false;
+    if (w->drag_source.potential_drag.type == POTENTIAL_DRAG_SELECTION) {
+        // A press on selected text that never became a drag is an ordinary click.
+        screen_start_selection(screen, w->mouse_pos.cell_x, w->mouse_pos.cell_y, w->mouse_pos.in_left_half_of_cell, false, EXTEND_CELL);
+    }
+    zero_at_ptr(&w->drag_source.potential_drag);
+    zero_at_ptr(&w->drag_source.initial_left_press);
 
     if (global_state.callback_os_window &&
         get_scrollbar_hit_type(w, global_state.callback_os_window->mouse_x, global_state.callback_os_window->mouse_y) == SCROLLBAR_HIT_NONE) {
@@ -658,6 +668,47 @@ distance(double x1, double y1, double x2, double y2) {
     return sqrt((x1 - x2) * (x1 - x2) + (y1 - y2) * (y1 - y2));
 }
 
+static void
+clear_click_queue(Window *w, int button) {
+    if (0 <= button && button < (ssize_t)arraysz(w->click_queues)) w->click_queues[button].length = 0;
+}
+
+// NB: This can call into Python, which can re-alloc the windows array, so w
+// must not be used after it returns. Keep it last in its callers.
+static void
+handle_potential_drag(Window *w, int button) {
+    if (button != GLFW_MOUSE_BUTTON_LEFT || !w->drag_source.initial_left_press.at || OPT(drag_threshold) <= 0) return;
+    if (distance(w->mouse_pos.global_x, w->mouse_pos.global_y, w->drag_source.initial_left_press.x, w->drag_source.initial_left_press.y) <= OPT(drag_threshold))
+        return;
+    zero_at_ptr(&w->drag_source.initial_left_press);
+    Screen *screen = w->render_data.screen;
+    // A native drag consumes the release event, including when canceled. Stop
+    // tracking the local gesture before handing it to the window system,
+    // otherwise the press lingers and the next one counts as a double click.
+    clear_click_queue(w, button);
+    if (w->drag_source.potential_drag.type == POTENTIAL_DRAG_SELECTION) {
+        zero_at_ptr(&w->drag_source.potential_drag);
+        global_state.active_drag_in_window = 0;
+        global_state.active_drag_button = -1;
+        set_mouse_cursor_for_screen(screen);
+        if (screen->callbacks != Py_None) {
+            PyObject *ret = PyObject_CallMethod(screen->callbacks, "drag_selection", NULL);
+            if (ret) Py_DECREF(ret);
+            else PyErr_Print();
+        }
+    } else if (w->drag_source.can_offer) {
+        drag_offer_start_to_child(w, w->mouse_pos.cell_x, w->mouse_pos.cell_y, (int)w->mouse_pos.global_x, (int)w->mouse_pos.global_y);
+        debug("Sent drag start event to child\n");
+    } else if (w->drag_source.potential_drag.type == POTENTIAL_DRAG_URL) {
+        w->drag_source.potential_drag.type = POTENTIAL_DRAG_NONE;
+        screen_detect_url(screen, w->drag_source.potential_drag.x, w->drag_source.potential_drag.y);
+        if (screen->current_hyperlink_under_mouse.id || screen->current_hyperlink_under_mouse.has_detected_url) {
+            screen_open_url(screen, "drag_url");
+            debug("Started URL drag\n");
+        }
+    }
+}
+
 HANDLER(handle_move_event) {
     modifiers &= ~GLFW_LOCK_MASK;
 
@@ -682,27 +733,7 @@ HANDLER(handle_move_event) {
             }
         }
     }
-    if (w->drag_source.initial_left_press.at &&
-        distance(w->mouse_pos.global_x, w->mouse_pos.global_y, w->drag_source.initial_left_press.x, w->drag_source.initial_left_press.y) >
-            OPT(drag_threshold)) {
-        zero_at_ptr(&w->drag_source.initial_left_press);
-        if (w->drag_source.can_offer) {
-            drag_offer_start_to_child(w, w->mouse_pos.cell_x, w->mouse_pos.cell_y, (int)w->mouse_pos.global_x, (int)w->mouse_pos.global_y);
-            debug("Sent drag start event to child\n");
-        } else if (w->drag_source.potential_url_drag.active) {
-            w->drag_source.potential_url_drag.active = false;
-            screen_detect_url(screen, w->drag_source.potential_url_drag.x, w->drag_source.potential_url_drag.y);
-            if (screen->current_hyperlink_under_mouse.id || screen->current_hyperlink_under_mouse.has_detected_url) {
-                screen_open_url(screen, "drag_url");
-                debug("Started URL drag\n");
-            }
-        }
-    }
-}
-
-static void
-clear_click_queue(Window *w, int button) {
-    if (0 <= button && button <= (ssize_t)arraysz(w->click_queues)) w->click_queues[button].length = 0;
+    handle_potential_drag(w, button);
 }
 
 #define N(n) (q->clicks[q->length - n])
@@ -861,14 +892,31 @@ dispatch_possible_click(Window *w, int button, int modifiers) {
     }
 }
 
+// Must be called for every button event before any early return, otherwise a
+// pending drag lingers and fires on a later mouse move with no button held.
+static void
+clear_potential_drag(Window *w, int button, bool is_release) {
+    zero_at_ptr(&w->drag_source.potential_drag);
+    if (is_release && button == GLFW_MOUSE_BUTTON_LEFT) zero_at_ptr(&w->drag_source.initial_left_press);
+}
+
+// Needs an up-to-date w->mouse_pos, as the drag threshold is measured from it.
+static void
+arm_potential_drag(Window *w, int button) {
+    if (button != GLFW_MOUSE_BUTTON_LEFT) return;
+    w->drag_source.initial_left_press.x = w->mouse_pos.global_x;
+    w->drag_source.initial_left_press.y = w->mouse_pos.global_y;
+    w->drag_source.initial_left_press.at = monotonic();
+}
+
 HANDLER(handle_button_event) {
     modifiers &= ~GLFW_LOCK_MASK;
     OSWindow *osw = global_state.callback_os_window;
     if (!osw) return;
-    w->drag_source.potential_url_drag.active = false;
 
     Tab *t = osw->tabs + osw->active_tab;
     bool is_release = !osw->mouse_button_pressed[button];
+    clear_potential_drag(w, button, is_release);
 
     if (handle_scrollbar_mouse(w, button, is_release ? RELEASE : PRESS, modifiers)) return;
 
@@ -879,16 +927,8 @@ HANDLER(handle_button_event) {
 
     bool a, b;
     if (!set_mouse_position(w, &a, &b)) return;
-    if (button == GLFW_MOUSE_BUTTON_LEFT) {
-        if (is_release) {
-            zero_at_ptr(&w->drag_source.initial_left_press);
-        } else {
-            osw->shader_anim_event_registry |= (1u << SHADER_ANIM_EVENT_POINTER_LEFT_BUTTON_PRESS);
-            w->drag_source.initial_left_press.x = w->mouse_pos.global_x;
-            w->drag_source.initial_left_press.y = w->mouse_pos.global_y;
-            w->drag_source.initial_left_press.at = monotonic();
-        }
-    }
+    if (!is_release) arm_potential_drag(w, button);
+    if (button == GLFW_MOUSE_BUTTON_LEFT && !is_release) osw->shader_anim_event_registry |= (1u << SHADER_ANIM_EVENT_POINTER_LEFT_BUTTON_PRESS);
     id_type wid = w->id;
     if (!dispatch_mouse_event(w, button, is_release ? -1 : 1, modifiers, screen->modes.mouse_tracking_mode != 0)) {
         if (screen->modes.mouse_tracking_mode != 0) {
@@ -1114,27 +1154,6 @@ mouse_region(bool detect_borders, bool detect_title_bar) {
     return ans;
 }
 
-static Window *
-closest_window_for_event(unsigned int *window_idx) {
-    Window *ans = NULL;
-    double closest_distance = UINT_MAX;
-    if (global_state.callback_os_window->num_tabs > 0) {
-        Tab *t = global_state.callback_os_window->tabs + global_state.callback_os_window->active_tab;
-        for (unsigned int i = 0; i < t->num_windows; i++) {
-            Window *w = t->windows + i;
-            if (w->visible) {
-                double d = distance_to_window(w);
-                if (d < closest_distance) {
-                    ans = w;
-                    closest_distance = d;
-                    *window_idx = i;
-                }
-            }
-        }
-    }
-    return ans;
-}
-
 void
 focus_in_event(void) {
     // Ensure that no URL is highlighted and the mouse cursor is in default shape
@@ -1210,6 +1229,7 @@ enter_event(int modifiers, bool cursor_moved) {
 
 
 typedef enum MouseSelectionType {
+    MOUSE_SELECTION_DRAG_OR_NORMAL_SELECT = -1,
     MOUSE_SELECTION_NORMAL,
     MOUSE_SELECTION_EXTEND,
     MOUSE_SELECTION_RECTANGLE,
@@ -1225,6 +1245,10 @@ typedef enum MouseSelectionType {
 
 void
 mouse_selection(Window *w, int code, int button) {
+    // A selection is ended by releasing the button that started it, which the
+    // wheel pseudo buttons never do
+    if (button < 0 || button > GLFW_MOUSE_BUTTON_LAST) return;
+    zero_at_ptr(&w->drag_source.potential_drag);
     global_state.active_drag_in_window = w->id;
     global_state.active_drag_button = button;
     Screen *screen = w->render_data.screen;
@@ -1238,6 +1262,25 @@ mouse_selection(Window *w, int code, int button) {
     }
 
     switch ((MouseSelectionType)code) {
+        case MOUSE_SELECTION_DRAG_OR_NORMAL_SELECT:
+            screen_pause_rendering(screen, false, 0);
+            if (button == GLFW_MOUSE_BUTTON_LEFT && OPT(drag_threshold) > 0) {
+                if (!screen->selections.in_progress && screen_is_cell_selected(screen, w->mouse_pos.cell_x, w->mouse_pos.cell_y)) {
+                    // Like iTerm2's mouseDownOnSelection: defer changing the
+                    // selection until we can distinguish a click from a drag.
+                    w->drag_source.potential_drag.type = POTENTIAL_DRAG_SELECTION;
+                    return;
+                }
+                if (screen->current_hyperlink_under_mouse.id || screen->current_hyperlink_under_mouse.has_detected_url) {
+                    w->drag_source.potential_drag.type = POTENTIAL_DRAG_URL;
+                    w->drag_source.potential_drag.x = w->mouse_pos.cell_x;
+                    w->drag_source.potential_drag.y = w->mouse_pos.cell_y;
+                    global_state.active_drag_in_window = 0;
+                    global_state.active_drag_button = -1;
+                    return;
+                }
+            }
+            /* fallthrough */
         case MOUSE_SELECTION_NORMAL:
             screen_start_selection(screen, w->mouse_pos.cell_x, w->mouse_pos.cell_y, w->mouse_pos.in_left_half_of_cell, false, EXTEND_CELL);
             break;
@@ -1434,19 +1477,20 @@ mouse_event(const int button, int modifiers, int action) {
         }
     } else if (w) {
         debug("grabbed: %d\n", w->render_data.screen->modes.mouse_tracking_mode != 0);
+        // Button presses/releases in the padding around the cell area of the
+        // window are mapped to the nearest cell, so that, for example,
+        // selections can be started by pressing in the padding. Note that this
+        // is deliberately not done for pure movement events so that merely
+        // hovering over the padding does not cause URL detection and the like.
+        // Also note that it does not apply to windows matched only because the
+        // mouse is over their scrollbar, which can be drawn in the margin,
+        // outside the window.
+        clamp_to_window = button > -1 && contains_mouse(w);
         handle_event(w, button, modifiers, window_idx);
-    } else if (button == GLFW_MOUSE_BUTTON_LEFT && osw->mouse_button_pressed[button]) {
-        // initial click, clamp it to the closest window
-        w = closest_window_for_event(&window_idx);
-        if (w) {
-            clamp_to_window = true;
-            debug("grabbed: %d\n", w->render_data.screen->modes.mouse_tracking_mode != 0);
-            handle_event(w, button, modifiers, window_idx);
-            clamp_to_window = false;
-        } else debug("no window for event\n");
+        clamp_to_window = false;
     } else {
         mouse_cursor_shape = DEFAULT_POINTER;
-        debug("\n");
+        debug("no window for event\n");
     }
     if (mouse_cursor_shape != old_cursor) set_mouse_cursor(mouse_cursor_shape);
 }
@@ -1513,6 +1557,142 @@ scale_scroll(
 #undef SCALE_SCROLL
 }
 
+// Number of mouse_map wheel steps in a scroll event: one per click for classic
+// wheels, one per 120 units for high resolution wheels and one per
+// MAPPED_SCROLL_STEP_PIXELS logical pixels of finger travel for touchpads, so
+// that the step does not depend on the font size. Wheels count clicks, so only
+// the sign of wheel_scroll_multiplier applies to them. direction is set to the
+// sign of the scaled offset, so that partial steps have a direction too.
+#define MAPPED_SCROLL_STEP_PIXELS 100.
+static int
+mapped_scroll_steps(GLFWOffsetType offset_type, double offset, double *pending, int *direction) {
+    double step_size = 1;
+    switch (offset_type) {
+        case GLFW_SCROLL_OFFSET_LINES: offset *= copysign(1., OPT(wheel_scroll_multiplier)); break;
+        case GLFW_SCROLL_OFFEST_V120:
+            offset *= copysign(1., OPT(wheel_scroll_multiplier));
+            step_size = 120;
+            break;
+        case GLFW_SCROLL_OFFEST_HIGHRES:
+            offset *= OPT(touch_scroll_multiplier);
+            step_size = MAPPED_SCROLL_STEP_PIXELS;
+            break;
+    }
+    *direction = offset > 0 ? 1 : (offset < 0 ? -1 : 0);
+    if (offset_type == GLFW_SCROLL_OFFSET_LINES) {
+        // apparently on cocoa some mice generate really small offsets when
+        // scrolling slowly, every event is at least one click
+        *pending = 0;
+        const int s = (int)round(offset);
+        return s ? s : *direction;
+    }
+    if (*pending * offset < 0) *pending = 0; // direction reversed, start a fresh step
+    *pending += offset;
+    const int s = (int)(*pending / step_size);
+    *pending -= s * step_size;
+    return s;
+}
+
+// Bit i of wheel_mappings[button - MOUSE_WHEEL_UP][grabbed] is set when the wheel is mapped
+// with the modifiers i, so that unmapped scrolling never calls into Python.
+#define WHEEL_MAPPING_MODS_MASK (GLFW_MOD_SHIFT | GLFW_MOD_ALT | GLFW_MOD_CONTROL | GLFW_MOD_SUPER | GLFW_MOD_HYPER | GLFW_MOD_META)
+static_assert(WHEEL_MAPPING_MODS_MASK < 64, "wheel mapping modifiers must fit in a uint64_t bitmap");
+
+bool
+set_wheel_mappings(PyObject *py_opts, Options *opts) {
+    memset(opts->wheel_mappings, 0, sizeof(opts->wheel_mappings));
+    RAII_PyObject(mousemap, PyObject_GetAttrString(py_opts, "mousemap"));
+    if (!mousemap) return false;
+    if (!PyDict_Check(mousemap)) {
+        PyErr_SetString(PyExc_TypeError, "mousemap must be a dict");
+        return false;
+    }
+    PyObject *key, *value;
+    Py_ssize_t pos = 0;
+    while (PyDict_Next(mousemap, &pos, &key, &value)) {
+        // keys are MouseEvent(button, mods, repeat_count, grabbed)
+        if (!PyTuple_Check(key) || PyTuple_GET_SIZE(key) < 4) {
+            PyErr_SetString(PyExc_TypeError, "mousemap keys must be MouseEvent tuples");
+            return false;
+        }
+        const long button = PyLong_AsLong(PyTuple_GET_ITEM(key, 0)), mods = PyLong_AsLong(PyTuple_GET_ITEM(key, 1));
+        if (PyErr_Occurred()) return false;
+        // modifiers outside the mask are stripped from events, so such a mapping can never match
+        if (button < MOUSE_WHEEL_UP || button > MOUSE_WHEEL_RIGHT || (mods & ~WHEEL_MAPPING_MODS_MASK)) continue;
+        const int grabbed = PyObject_IsTrue(PyTuple_GET_ITEM(key, 3));
+        if (grabbed < 0) return false;
+        opts->wheel_mappings[button - MOUSE_WHEEL_UP][grabbed] |= 1ull << mods;
+    }
+    return true;
+}
+
+static bool
+wheel_is_mapped(int button, bool grabbed, int mods) {
+    return OPT(wheel_mappings)[button - MOUSE_WHEEL_UP][grabbed] & (1ull << mods);
+}
+
+// Fires the wheel mouse_map actions for one axis of a scroll event. Returns
+// true if the wheel is mapped for it, in which case the event is consumed even
+// if it does not complete a step, so the screen does not also scroll.
+static bool
+dispatch_mapped_scroll_axis(OSWindow *osw, Window *w, const GLFWScrollEvent *ev, bool vertical, int mods, bool grabbed) {
+    double *pending = vertical ? &osw->scroll.mapped_pending_pixels_y : &osw->scroll.mapped_pending_pixels_x;
+    double p = *pending;
+    int direction;
+    // unscaled is in logical pixels for touchpads and equal to the offset otherwise
+    const int steps = mapped_scroll_steps(ev->offset_type, vertical ? ev->unscaled.y : ev->unscaled.x, &p, &direction);
+    // positive offsets are upwards and leftwards
+    const int button = vertical ? (direction > 0 ? MOUSE_WHEEL_UP : MOUSE_WHEEL_DOWN) : (direction > 0 ? MOUSE_WHEEL_LEFT : MOUSE_WHEEL_RIGHT);
+    if (!direction || !wheel_is_mapped(button, grabbed, mods)) {
+        *pending = 0;
+        return false;
+    }
+    *pending = p;
+    if (steps) dispatch_mouse_event(w, button, abs(steps), ev->keyboard_modifiers, grabbed);
+    return true;
+}
+
+// Returns true if either axis of the scroll event is mapped, in which case the
+// whole event is consumed.
+static bool
+dispatch_mapped_scroll(OSWindow *osw, Window *w, const GLFWScrollEvent *ev, int mods, bool grabbed) {
+    // A partial step does not carry over to a different window, modifiers or mouse mode
+    if (osw->scroll.mapped_window_id != w->id || osw->scroll.mapped_modifiers != mods || osw->scroll.mapped_grabbed != grabbed)
+        osw->scroll.mapped_pending_pixels_x = osw->scroll.mapped_pending_pixels_y = 0;
+    // Both axes are always dispatched, so that a diagonal gesture can fire both
+    const bool consumed_y = ev->y_offset != 0.0 && dispatch_mapped_scroll_axis(osw, w, ev, true, mods, grabbed);
+    const bool consumed_x = ev->x_offset != 0.0 && dispatch_mapped_scroll_axis(osw, w, ev, false, mods, grabbed);
+    if (!consumed_x && !consumed_y) return false;
+    osw->scroll.mapped_window_id = w->id;
+    osw->scroll.mapped_modifiers = mods;
+    osw->scroll.mapped_grabbed = grabbed;
+    osw->scroll.mapped_last_event_at = monotonic();
+    return true;
+}
+
+// The longest gap between two scroll events that can belong to the same
+// gesture. Touchpads report at least at display refresh rate while the fingers
+// move, so this only has to outlast a dropped frame or two.
+#define MAPPED_GESTURE_MAX_GAP_MS 200ll
+
+// An unmapped event continues a mapped gesture only if it belongs to the same
+// gesture, that is, it arrives promptly after the previous event of that
+// gesture, in the same window and mouse mode with the same modifiers, and only
+// scrolls along axes that have no mappings at all, for example, horizontal
+// jitter during a vertical gesture. Otherwise the momentum of a following,
+// unmapped gesture would be swallowed. Both the mouse mode and the elapsed time
+// have to be checked because the set of mapped wheel buttons changes with the
+// mode and a classic wheel has no end-of-gesture event, so without them an
+// unmapped direction would stay swallowed indefinitely.
+static bool
+continues_mapped_gesture(const OSWindow *osw, const Window *w, const GLFWScrollEvent *ev, int mods, bool grabbed) {
+    if (osw->scroll.mapped_window_id != w->id || osw->scroll.mapped_modifiers != mods || osw->scroll.mapped_grabbed != grabbed) return false;
+    if (monotonic() - osw->scroll.mapped_last_event_at > ms_to_monotonic_t(MAPPED_GESTURE_MAX_GAP_MS)) return false;
+    if (ev->y_offset != 0.0 && (wheel_is_mapped(MOUSE_WHEEL_UP, grabbed, mods) || wheel_is_mapped(MOUSE_WHEEL_DOWN, grabbed, mods))) return false;
+    if (ev->x_offset != 0.0 && (wheel_is_mapped(MOUSE_WHEEL_LEFT, grabbed, mods) || wheel_is_mapped(MOUSE_WHEEL_RIGHT, grabbed, mods))) return false;
+    return true;
+}
+
 static const char *
 scroll_offset_type(GLFWOffsetType t) {
     switch (t) {
@@ -1543,6 +1723,94 @@ pixel_scroll_enabled_for_screen(const Screen *screen) {
     return OPT(pixel_scroll) && screen->linebuf == screen->main_linebuf;
 }
 
+static id_type window_for_momentum_scroll = 0;
+static bool main_screen_for_momentum_scroll = false;
+
+static void
+scroll_event_in_window(OSWindow *osw, Window *w, const GLFWScrollEvent *ev, unsigned cell_width, unsigned cell_height) {
+    Screen *screen = w->render_data.screen;
+
+    switch (ev->momentum_type) {
+        case GLFW_NO_MOMENTUM_DATA: break;
+        case GLFW_MOMENTUM_PHASE_BEGAN:
+            window_for_momentum_scroll = w->id;
+            main_screen_for_momentum_scroll = screen->linebuf == screen->main_linebuf;
+            break;
+        case GLFW_MOMENTUM_PHASE_STATIONARY:
+        case GLFW_MOMENTUM_PHASE_ACTIVE:
+            if (window_for_momentum_scroll != w->id || main_screen_for_momentum_scroll != (screen->linebuf == screen->main_linebuf)) return;
+            break;
+        case GLFW_MOMENTUM_PHASE_ENDED:
+        case GLFW_MOMENTUM_PHASE_CANCELED: window_for_momentum_scroll = 0; break;
+        case GLFW_MOMENTUM_PHASE_MAY_BEGIN: break;
+    }
+    if (ev->momentum_type == GLFW_NO_MOMENTUM_DATA) {
+        const bool grabbed = screen->modes.mouse_tracking_mode != NO_TRACKING;
+        const int mods = ev->keyboard_modifiers & WHEEL_MAPPING_MODS_MASK;
+        if (dispatch_mapped_scroll(osw, w, ev, mods, grabbed)) osw->scroll.mapped_gesture = true;
+        else if (osw->scroll.mapped_gesture) {
+            osw->scroll.mapped_gesture = continues_mapped_gesture(osw, w, ev, mods, grabbed);
+            // The gesture now extends to this event, so the next one is timed from here
+            if (osw->scroll.mapped_gesture) osw->scroll.mapped_last_event_at = monotonic();
+        }
+        if (osw->scroll.mapped_gesture) return;
+    } else if (osw->scroll.mapped_gesture) {
+        // Inertial scrolling after a mapped gesture neither fires the mappings nor scrolls
+        osw->scroll.mapped_pending_pixels_x = osw->scroll.mapped_pending_pixels_y = 0;
+        osw->scroll.mapped_last_event_at = monotonic();
+        // Once the momentum is spent the gesture is over, so a later unmapped
+        // event in the same window with the same modifiers scrolls normally
+        if (ev->momentum_type == GLFW_MOMENTUM_PHASE_ENDED || ev->momentum_type == GLFW_MOMENTUM_PHASE_CANCELED) osw->scroll.mapped_gesture = false;
+        return;
+    }
+    finish_scroll_animation(screen);
+    if (ev->y_offset != 0.0) {
+        if (screen->modes.mouse_tracking_mode == NO_TRACKING && pixel_scroll_enabled_for_screen(screen) &&
+            (ev->offset_type == GLFW_SCROLL_OFFEST_HIGHRES || ev->offset_type == GLFW_SCROLL_OFFEST_V120)) {
+            double delta_pixels;
+            if (ev->offset_type == GLFW_SCROLL_OFFEST_HIGHRES) {
+                delta_pixels = ev->y_offset * OPT(touch_scroll_multiplier);
+            } else {
+                const double offset_lines = (ev->y_offset / 120.) * OPT(wheel_scroll_multiplier);
+                delta_pixels = offset_lines * cell_height;
+            }
+            osw->scroll.pending_pixels_y = 0.0;
+            if (screen_apply_pixel_scroll(screen, delta_pixels) && screen->selections.in_progress) update_drag(w);
+        } else {
+            int s = scale_scroll(
+                screen->modes.mouse_tracking_mode, ev->y_offset, ev->offset_type, &osw->scroll.pending_pixels_y, cell_height, &osw->scroll.last_v120_dir_y);
+            if (s) {
+                bool upwards = s > 0;
+                if (screen->modes.mouse_tracking_mode) {
+                    int sz = encode_mouse_scroll(w, upwards ? 4 : 5, ev->keyboard_modifiers);
+                    if (sz > 0) {
+                        mouse_event_buf[sz] = 0;
+                        for (s = abs(s); s > 0; s--) { write_escape_code_to_child(screen, ESC_CSI, mouse_event_buf); }
+                    }
+                } else {
+                    if (screen->linebuf == screen->main_linebuf) {
+                        screen_history_scroll(screen, abs(s), upwards);
+                        if (screen->selections.in_progress) update_drag(w);
+                    } else fake_scroll(w, abs(s), upwards);
+                }
+            }
+        }
+    }
+    if (ev->x_offset != 0.0) {
+        int s = scale_scroll(
+            screen->modes.mouse_tracking_mode, ev->x_offset, ev->offset_type, &osw->scroll.pending_pixels_x, cell_width, &osw->scroll.last_v120_dir_x);
+        if (s) {
+            if (screen->modes.mouse_tracking_mode) {
+                int sz = encode_mouse_scroll(w, s > 0 ? 6 : 7, ev->keyboard_modifiers);
+                if (sz > 0) {
+                    mouse_event_buf[sz] = 0;
+                    for (s = abs(s); s > 0; s--) { write_escape_code_to_child(screen, ESC_CSI, mouse_event_buf); }
+                }
+            }
+        }
+    }
+}
+
 void
 scroll_event(const GLFWScrollEvent *ev) {
     debug(
@@ -1552,8 +1820,6 @@ scroll_event(const GLFWScrollEvent *ev) {
         ev->y_offset,
         scroll_phase(ev->momentum_type),
         format_mods(ev->keyboard_modifiers));
-    static id_type window_for_momentum_scroll = 0;
-    static bool main_screen_for_momentum_scroll = false;
     // allow scroll events even if window is not currently focused (in
     // which case on some platforms such as macOS the mouse location is zeroed so
     // window_for_event() does not work).
@@ -1561,8 +1827,7 @@ scroll_event(const GLFWScrollEvent *ev) {
     if (!osw->is_focused && osw->handle) {
         double mouse_x, mouse_y;
         glfwGetCursorPos((GLFWwindow *)osw->handle, &mouse_x, &mouse_y);
-        osw->mouse_x = mouse_x * osw->viewport_x_ratio;
-        osw->mouse_y = mouse_y * osw->viewport_y_ratio;
+        set_os_window_mouse_position(osw, mouse_x, mouse_y);
     }
     MouseRegion r = mouse_region(false, true);
     Window *w = r.window;
@@ -1584,78 +1849,7 @@ scroll_event(const GLFWScrollEvent *ev) {
             w->mouse_pos.in_left_half_of_cell = in_left_half_of_cell;
         }
     }
-    Screen *screen = w->render_data.screen;
-
-    switch (ev->momentum_type) {
-        case GLFW_NO_MOMENTUM_DATA: break;
-        case GLFW_MOMENTUM_PHASE_BEGAN:
-            window_for_momentum_scroll = w->id;
-            main_screen_for_momentum_scroll = screen->linebuf == screen->main_linebuf;
-            break;
-        case GLFW_MOMENTUM_PHASE_STATIONARY:
-        case GLFW_MOMENTUM_PHASE_ACTIVE:
-            if (window_for_momentum_scroll != w->id || main_screen_for_momentum_scroll != (screen->linebuf == screen->main_linebuf)) return;
-            break;
-        case GLFW_MOMENTUM_PHASE_ENDED:
-        case GLFW_MOMENTUM_PHASE_CANCELED: window_for_momentum_scroll = 0; break;
-        case GLFW_MOMENTUM_PHASE_MAY_BEGIN: break;
-    }
-    finish_scroll_animation(screen);
-    if (ev->y_offset != 0.0) {
-        if (screen->modes.mouse_tracking_mode == NO_TRACKING && pixel_scroll_enabled_for_screen(screen) &&
-            (ev->offset_type == GLFW_SCROLL_OFFEST_HIGHRES || ev->offset_type == GLFW_SCROLL_OFFEST_V120)) {
-            double delta_pixels;
-            if (ev->offset_type == GLFW_SCROLL_OFFEST_HIGHRES) {
-                delta_pixels = ev->y_offset * OPT(touch_scroll_multiplier);
-            } else {
-                const double offset_lines = (ev->y_offset / 120.) * OPT(wheel_scroll_multiplier);
-                delta_pixels = offset_lines * global_state.callback_os_window->fonts_data->fcm.cell_height;
-            }
-            osw->scroll.pending_pixels_y = 0.0;
-            if (screen_apply_pixel_scroll(screen, delta_pixels) && screen->selections.in_progress) update_drag(w);
-        } else {
-            int s = scale_scroll(
-                screen->modes.mouse_tracking_mode,
-                ev->y_offset,
-                ev->offset_type,
-                &osw->scroll.pending_pixels_y,
-                global_state.callback_os_window->fonts_data->fcm.cell_height,
-                &osw->scroll.last_v120_dir_y);
-            if (s) {
-                bool upwards = s > 0;
-                if (screen->modes.mouse_tracking_mode) {
-                    int sz = encode_mouse_scroll(w, upwards ? 4 : 5, ev->keyboard_modifiers);
-                    if (sz > 0) {
-                        mouse_event_buf[sz] = 0;
-                        for (s = abs(s); s > 0; s--) { write_escape_code_to_child(screen, ESC_CSI, mouse_event_buf); }
-                    }
-                } else {
-                    if (screen->linebuf == screen->main_linebuf) {
-                        screen_history_scroll(screen, abs(s), upwards);
-                        if (screen->selections.in_progress) update_drag(w);
-                    } else fake_scroll(w, abs(s), upwards);
-                }
-            }
-        }
-    }
-    if (ev->x_offset != 0.0) {
-        int s = scale_scroll(
-            screen->modes.mouse_tracking_mode,
-            ev->x_offset,
-            ev->offset_type,
-            &osw->scroll.pending_pixels_x,
-            global_state.callback_os_window->fonts_data->fcm.cell_width,
-            &osw->scroll.last_v120_dir_x);
-        if (s) {
-            if (screen->modes.mouse_tracking_mode) {
-                int sz = encode_mouse_scroll(w, s > 0 ? 6 : 7, ev->keyboard_modifiers);
-                if (sz > 0) {
-                    mouse_event_buf[sz] = 0;
-                    for (s = abs(s); s > 0; s--) { write_escape_code_to_child(screen, ESC_CSI, mouse_event_buf); }
-                }
-            }
-        }
-    }
+    scroll_event_in_window(osw, w, ev, osw->fonts_data->fcm.cell_width, osw->fonts_data->fcm.cell_height);
 }
 
 static PyObject *
@@ -1708,14 +1902,33 @@ send_mock_mouse_event_to_window(PyObject *self UNUSED, PyObject *args) {
     PyObject *capsule;
     int button, modifiers, is_release, clear_clicks, in_left_half_of_cell;
     unsigned int x, y;
-    if (!PyArg_ParseTuple(args, "O!iipIIpp", &PyCapsule_Type, &capsule, &button, &modifiers, &is_release, &x, &y, &clear_clicks, &in_left_half_of_cell))
+    PyObject *pixel_x = Py_None, *pixel_y = Py_None;
+    if (!PyArg_ParseTuple(
+            args,
+            "O!iipIIpp|OO",
+            &PyCapsule_Type,
+            &capsule,
+            &button,
+            &modifiers,
+            &is_release,
+            &x,
+            &y,
+            &clear_clicks,
+            &in_left_half_of_cell,
+            &pixel_x,
+            &pixel_y))
         return NULL;
     Window *w = PyCapsule_GetPointer(capsule, "Window");
     if (!w) return NULL;
     if (clear_clicks) clear_click_queue(w, button);
     bool mouse_cell_changed = x != w->mouse_pos.cell_x || y != w->mouse_pos.cell_y || w->mouse_pos.in_left_half_of_cell != in_left_half_of_cell;
-    w->mouse_pos.global_x = 10 * x;
-    w->mouse_pos.global_y = 20 * y;
+    // None means derive the pixel position from the cell, so that tests that do
+    // not care about sub-cell positions stay terse. Negative values are legal.
+    const double px = pixel_x == Py_None ? 10 * x : PyFloat_AsDouble(pixel_x);
+    const double py = pixel_y == Py_None ? 20 * y : PyFloat_AsDouble(pixel_y);
+    if (PyErr_Occurred()) return NULL;
+    w->mouse_pos.global_x = px;
+    w->mouse_pos.global_y = py;
     w->mouse_pos.cell_x = x;
     w->mouse_pos.cell_y = y;
     w->mouse_pos.in_left_half_of_cell = in_left_half_of_cell;
@@ -1723,12 +1936,18 @@ send_mock_mouse_event_to_window(PyObject *self UNUSED, PyObject *args) {
     if (button < 0) {
         if (button == -2) do_drag_scroll(w, true);
         else if (button == -3) do_drag_scroll(w, false);
-        else handle_mouse_movement_in_kitty(w, last_button_pressed, mouse_cell_changed);
+        else {
+            if (OPT(detect_urls)) detect_url(w->render_data.screen, x, y);
+            handle_mouse_movement_in_kitty(w, last_button_pressed, mouse_cell_changed);
+            handle_potential_drag(w, last_button_pressed);
+        }
     } else {
         if (global_state.active_drag_in_window && is_release && button == global_state.active_drag_button) {
             end_drag(w);
         } else {
-            dispatch_mouse_event(w, button, is_release ? -1 : 1, modifiers, false);
+            clear_potential_drag(w, button, is_release);
+            if (!is_release) arm_potential_drag(w, button);
+            dispatch_mouse_event(w, button, is_release ? -1 : 1, modifiers, w->render_data.screen->modes.mouse_tracking_mode != NO_TRACKING);
             if (!is_release) {
                 last_button_pressed = button;
                 add_press(w, button, modifiers);
@@ -1766,11 +1985,53 @@ test_scale_scroll(PyObject *self UNUSED, PyObject *args) {
     return ans;
 }
 
+static PyObject *
+test_mapped_scroll_steps(PyObject *self UNUSED, PyObject *args) {
+    int offset_type;
+    PyObject *values;
+    if (!PyArg_ParseTuple(args, "iO!", &offset_type, &PyList_Type, &values)) return NULL;
+    double pending = 0;
+    int direction;
+    PyObject *ans = PyList_New(PyList_GET_SIZE(values));
+    if (!ans) return NULL;
+    for (Py_ssize_t i = 0; i < PyList_GET_SIZE(values); i++) {
+        const double v = PyFloat_AsDouble(PyList_GET_ITEM(values, i));
+        PyObject *t = PyErr_Occurred() ? NULL : PyLong_FromLong(mapped_scroll_steps(offset_type, v, &pending, &direction));
+        if (!t) {
+            Py_DECREF(ans);
+            return NULL;
+        }
+        PyList_SET_ITEM(ans, i, t);
+    }
+    return ans;
+}
+
+static PyObject *
+send_mock_scroll_event_to_window(PyObject *self UNUSED, PyObject *args) {
+    PyObject *capsule;
+    GLFWScrollEvent ev = {0};
+    int offset_type, momentum_type = GLFW_NO_MOMENTUM_DATA;
+    if (!PyArg_ParseTuple(args, "O!iddi|i", &PyCapsule_Type, &capsule, &offset_type, &ev.x_offset, &ev.y_offset, &ev.keyboard_modifiers, &momentum_type))
+        return NULL;
+    Window *w = PyCapsule_GetPointer(capsule, "Window");
+    if (!w) return NULL;
+    // Scroll state is per OS window, mock windows share this one
+    static OSWindow osw = {0};
+    ev.offset_type = offset_type;
+    ev.momentum_type = momentum_type;
+    ev.unscaled.x = ev.x_offset;
+    ev.unscaled.y = ev.y_offset;
+    scroll_event_in_window(&osw, w, &ev, w->render_data.screen->cell_size.width, w->render_data.screen->cell_size.height);
+    Py_RETURN_NONE;
+}
+
 static PyMethodDef module_methods[] = {
     {"send_mouse_event", (PyCFunction)(void (*)(void))(send_mouse_event), METH_VARARGS | METH_KEYWORDS, NULL},
     METHODB(test_encode_mouse, METH_VARARGS),
     METHODB(test_scale_scroll, METH_VARARGS),
+    METHODB(test_mapped_scroll_steps, METH_VARARGS),
     METHODB(send_mock_mouse_event_to_window, METH_VARARGS),
+    METHODB(send_mock_scroll_event_to_window, METH_VARARGS),
     METHODB(mock_mouse_selection, METH_VARARGS),
     {NULL, NULL, 0, NULL} /* Sentinel */
 };
@@ -1781,6 +2042,7 @@ init_mouse(PyObject *module) {
     PyModule_AddIntMacro(module, RELEASE);
     PyModule_AddIntMacro(module, DRAG);
     PyModule_AddIntMacro(module, MOVE);
+    PyModule_AddIntMacro(module, MOUSE_SELECTION_DRAG_OR_NORMAL_SELECT);
     PyModule_AddIntMacro(module, MOUSE_SELECTION_NORMAL);
     PyModule_AddIntMacro(module, MOUSE_SELECTION_EXTEND);
     PyModule_AddIntMacro(module, MOUSE_SELECTION_RECTANGLE);
@@ -1791,6 +2053,10 @@ init_mouse(PyObject *module) {
     PyModule_AddIntMacro(module, MOUSE_SELECTION_WORD_AND_LINE_FROM_POINT);
     PyModule_AddIntMacro(module, MOUSE_SELECTION_MOVE_END);
     PyModule_AddIntMacro(module, MOUSE_SELECTION_UPTO_SURROUNDING_WHITESPACE);
+    PyModule_AddIntMacro(module, MOUSE_WHEEL_UP);
+    PyModule_AddIntMacro(module, MOUSE_WHEEL_DOWN);
+    PyModule_AddIntMacro(module, MOUSE_WHEEL_LEFT);
+    PyModule_AddIntMacro(module, MOUSE_WHEEL_RIGHT);
     if (PyModule_AddFunctions(module, module_methods) != 0) return false;
     return true;
 }

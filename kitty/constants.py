@@ -22,7 +22,7 @@ class Version(NamedTuple):
 
 appname: str = 'kitty'
 kitty_face = '🐱'
-version: Version = Version(0, 48, 2)
+version: Version = Version(0, 49, 2)
 str_version: str = '.'.join(map(str, version))
 _plat = sys.platform.lower()
 is_macos: bool = 'darwin' in _plat
@@ -220,9 +220,9 @@ def glfw_path(module: str) -> str:
 
 
 def detect_if_wayland_ok() -> bool:
-    if 'WAYLAND_DISPLAY' not in os.environ and 'WAYLAND_SOCKET' not in os.environ:
+    if not os.environ.get('WAYLAND_DISPLAY') and not os.environ.get('WAYLAND_SOCKET'):
         return False
-    if 'KITTY_DISABLE_WAYLAND' in os.environ:
+    if os.environ.get('KITTY_DISABLE_WAYLAND'):
         return False
     wayland = glfw_path('wayland')
     if not os.path.exists(wayland):

@@ -313,6 +313,7 @@ add_os_window(void) {
     ans->tab_bar_render_data.vao_idx = create_cell_vao();
     ans->background_opacity.alpha = OPT(background_opacity);
     ans->created_at = monotonic();
+    init_shader_animation_state(ans);
     END_WITH_OS_WINDOW_REFS
     return ans;
 }
@@ -431,8 +432,7 @@ destroy_window(Window *w) {
     drag_free_offer(w, true);
     free(w->pending_clicks.clicks);
     zero_at_ptr(&w->pending_clicks);
-    free(w->buffered_keys.key_data);
-    zero_at_ptr(&w->buffered_keys);
+    free_buffered_keys(w);
     Py_CLEAR(w->render_data.screen);
     Py_CLEAR(w->title);
     Py_CLEAR(w->title_bar_data.last_drawn_title_object_id);
@@ -590,6 +590,8 @@ destroy_os_window_item(OSWindow *w) {
     if (w->indirect_output.fbo_b_id) free_framebuffer(&w->indirect_output.fbo_b_id);
     if (w->persist_texture_id) free_texture(&w->persist_texture_id);
     if (w->persist_fbo_id) free_framebuffer(&w->persist_fbo_id);
+    free(w->pointer_map.data);
+    zero_at_ptr(&w->pointer_map);
 }
 
 bool
@@ -729,14 +731,17 @@ pyset_borders_rects(PyObject *self UNUSED, PyObject *args) {
     BorderRects *br = &tab->border_rects;
     br->is_dirty = true;
     br->num_border_rects = PyList_GET_SIZE(rects);
+    br->num_rounded_rects = 0;
     ensure_space_for(br, rect_buf, BorderRect, br->num_border_rects + 1, capacity, 32, false);
     for (unsigned i = 0; i < br->num_border_rects; i++) {
         PyObject *pr = PyList_GET_ITEM(rects, i);
         unsigned long color;
         long long border_type;
         BorderRect *r = br->rect_buf + i;
-        int horizontal;
-        if (!PyArg_ParseTuple(pr, "IIIIkLp", &r->px.left, &r->px.top, &r->px.right, &r->px.bottom, &color, &border_type, &horizontal)) return NULL;
+        int horizontal, render;
+        if (!PyArg_ParseTuple(
+                pr, "IIIIkLppII", &r->px.left, &r->px.top, &r->px.right, &r->px.bottom, &color, &border_type, &horizontal, &render, &r->radius, &r->thickness))
+            return NULL;
         r->left = gl_pos_x(r->px.left, osw->viewport_width);
         r->top = gl_pos_y(r->px.top, osw->viewport_height);
         r->right = r->left + gl_size(r->px.right - r->px.left, osw->viewport_width);
@@ -744,6 +749,8 @@ pyset_borders_rects(PyObject *self UNUSED, PyObject *args) {
         r->color = color;
         r->border_type = border_type;
         r->horizontal = horizontal;
+        if (r->radius && r->thickness) br->num_rounded_rects++;
+        if (!render) r->left = r->top = r->right = r->bottom = -2.f;
     }
     END_WITH_TAB
     Py_RETURN_NONE;
@@ -895,6 +902,15 @@ dispatch_pending_clicks(id_type timer_id UNUSED, void *data UNUSED) {
     } while (dispatched);
 }
 
+void
+update_ime_state_in_os_window(OSWindow *osw, Window *window, int update_focus) {
+    OSWindow *orig = global_state.callback_os_window;
+    global_state.callback_os_window = osw;
+    if (update_focus) update_ime_focus(osw, update_focus > 0);
+    if (update_focus >= 0 && window->render_data.screen) { update_ime_position(window, window->render_data.screen); }
+    global_state.callback_os_window = orig;
+}
+
 bool
 update_ime_position_for_window(id_type window_id, bool force, int update_focus) {
     for (size_t o = 0; o < global_state.num_os_windows; o++) {
@@ -906,11 +922,7 @@ update_ime_position_for_window(id_type window_id, bool force, int update_focus) 
                 if (window->id == window_id) {
                     // The screen may not be ready after the new window is created and focused, and still needs to enable IME.
                     if ((window->render_data.screen && (force || osw->is_focused)) || update_focus > 0) {
-                        OSWindow *orig = global_state.callback_os_window;
-                        global_state.callback_os_window = osw;
-                        if (update_focus) update_ime_focus(osw, update_focus > 0);
-                        if (update_focus >= 0 && window->render_data.screen) { update_ime_position(window, window->render_data.screen); }
-                        global_state.callback_os_window = orig;
+                        update_ime_state_in_os_window(osw, window, update_focus);
                         return true;
                     }
                     return false;
@@ -1093,6 +1105,7 @@ PYWRAP1(set_options) {
     global_state.debug_rendering = debug_rendering ? true : false;
     global_state.debug_font_fallback = debug_font_fallback ? true : false;
     if (!convert_opts_from_python_opts(opts, &global_state.opts)) return NULL;
+    if (!set_wheel_mappings(opts, &global_state.opts)) return NULL;
     push_modifier_remap_to_glfw();
     Py_XDECREF(global_state.options_object);
     global_state.options_object = Py_NewRef(opts);
@@ -1550,8 +1563,12 @@ PYWRAP1(set_os_window_pos) {
 
 PYWRAP1(set_boss) {
     Py_CLEAR(global_state.boss);
-    global_state.boss = args;
-    Py_INCREF(global_state.boss);
+    if (args == Py_None) {
+        global_state.boss = NULL;
+    } else {
+        global_state.boss = args;
+        Py_INCREF(global_state.boss);
+    }
     Py_RETURN_NONE;
 }
 

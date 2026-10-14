@@ -16,7 +16,6 @@ from dataclasses import dataclass
 from functools import partial
 from gettext import gettext as _
 from gettext import ngettext
-from math import floor
 from time import sleep
 from typing import (
     TYPE_CHECKING,
@@ -103,6 +102,7 @@ from .fast_data_types import (
     global_font_size,
     grab_keyboard,
     is_layer_shell_supported,
+    is_modifier_key,
     last_focused_os_window_id,
     load_png_data,
     macos_cycle_through_os_windows,
@@ -140,7 +140,7 @@ from .keys import Mappings
 from .layout.base import set_layout_options
 from .notifications import NotificationManager
 from .options.types import Options, nullable_colors
-from .options.utils import MINIMUM_FONT_SIZE, KeyboardMode, KeyDefinition
+from .options.utils import KeyboardMode, KeyDefinition, MapType, clamp_font_size
 from .os_window_size import initial_window_size_func
 from .session import (
     Session,
@@ -154,7 +154,7 @@ from .session import (
 )
 from .shaders.slang import load_shader_programs
 from .simple_cli_definitions import grab_keyboard_docs
-from .tabs import SpecialWindow, SpecialWindowInstance, Tab, TabDict, TabManager
+from .tabs import DropDirection, SpecialWindow, SpecialWindowInstance, Tab, TabDict, TabManager
 from .types import AsyncResponse, LayerShellConfig, SingleInstanceData, WindowSystemMouseEvent, ac
 from .typing_compat import PopenType, TypedDict
 from .utils import (
@@ -163,6 +163,7 @@ from .utils import (
     get_editor,
     get_new_os_window_size,
     is_ok_to_read_image_file,
+    is_ok_to_read_image_path,
     is_path_in_temp_dir,
     less_version,
     log_error,
@@ -187,6 +188,9 @@ if TYPE_CHECKING:
 # }}}
 
 RCResponse = Union[dict[str, Any], None, AsyncResponse]
+
+# How long files dropped onto kitty as macOS file promises are kept alive for, in seconds
+DROPPED_FILE_PROMISES_LIFETIME = 600.0
 
 ThumbnailCallback = Callable[[int, int, bytes, int, int], None]
 
@@ -453,14 +457,17 @@ class Boss:
             DumpCommands(args) if args.dump_commands or args.dump_bytes else None,
             talk_fd,
             listen_fd,
-            self.listening_on.startswith('unix:'),
         )
         self.args: CLIOptions = args
         self.mouse_handler: Callable[[WindowSystemMouseEvent], None] | None = None
         set_boss(self)
         self.mappings: Mappings = Mappings(global_shortcuts, self.refresh_active_tab_bar)
         self.notification_manager: NotificationManager = NotificationManager(debug=self.args.debug_keyboard or self.args.debug_rendering)
-        self.atexit.unlink(store_effective_config())
+        effective_config_path, effective_config_error = store_effective_config()
+        if effective_config_path:
+            self.atexit.unlink(effective_config_path)
+        if effective_config_error:
+            self.misc_config_errors.append(effective_config_error)
 
     def startup_first_child(self, os_window_id: int | None, startup_sessions: Iterable[Session] = ()) -> None:
         si = startup_sessions or create_sessions(get_options(), self.args, default_session=get_options().startup_session)
@@ -469,7 +476,7 @@ class Boss:
         with Window.set_ignore_focus_changes_for_new_windows():
             for startup_session in si:
                 # The window state from the CLI options will override and apply to every single OS window in startup session
-                wstate = self.args.start_as if self.args.start_as and self.args.start_as != 'normal' else None
+                wstate = self.args.start_as if self.args.start_as and self.args.start_as != 'normal' else None  # ty: ignore[redundant-condition]
                 wid = self.add_os_window(startup_session, window_state=wstate, os_window_id=os_window_id)
                 if startup_session.focus_os_window:
                     focused_os_window = wid
@@ -730,6 +737,7 @@ class Boss:
         if isinstance(args, SpecialWindowInstance):
             sw: SpecialWindowInstance | None = args
         else:
+            args = tuple(args)
             sw = self.args_to_special_window(args, cwd_from) if args else None
         startup_session = next(create_sessions(get_options(), special_window=sw, cwd_from=cwd_from))
         startup_session.session_name = ''
@@ -1016,7 +1024,7 @@ class Boss:
             if data['args'][0] == 'panel':
                 from kittens.panel.main import handle_single_instance_command
 
-                handle_single_instance_command(self, data['args'], data['environ'], data.get('notify_on_os_window_death', ''))
+                handle_single_instance_command(self, data['args'], data['environ'], data.get('notify_on_os_window_death', ''), data.get('cwd', ''))
                 return None
             from .cli_stub import CLIOptions
 
@@ -1062,7 +1070,7 @@ class Boss:
                                 assert isinstance(window.launch_spec, LaunchSpec)
                                 launch(get_boss(), window.launch_spec.opts, window.launch_spec.args)
                     continue
-                wstate = args.start_as if args.start_as and args.start_as != 'normal' else None
+                wstate = args.start_as if args.start_as and args.start_as != 'normal' else None  # ty: ignore[redundant-condition]
                 os_window_id = self.add_os_window(
                     session,
                     wclass=args.cls,
@@ -1546,6 +1554,10 @@ class Boss:
             tm.handle_tab_bar_mouse(x, y, button, modifiers, action)
 
     def start_tab_drag(self, os_window_id: int, window_id: int, pixels: bytes, width: int, height: int) -> None:
+        # A previous drag whose drop never reached _reset_drop_previews (failed transfer, dragged
+        # tab closed, etc.) can leave stale pre-hover focus behind, discard it.
+        for q in self.all_tab_managers:
+            q.finish_tab_drag_hover(restore_focus=False)
         if tm := self.os_window_map.get(os_window_id):
             tm.start_tab_drag(pixels, width, height)
 
@@ -1659,12 +1671,10 @@ class Boss:
             self.show_error(_('Unknown clear type'), _('The clear type: {} is unknown').format(action))
 
     def increase_font_size(self) -> None:  # legacy
-        cfs = global_font_size()
-        self.set_font_size(min(get_options().font_size * 5, cfs + 2.0))
+        self.set_font_size(global_font_size() + 2.0)
 
     def decrease_font_size(self) -> None:  # legacy
-        cfs = global_font_size()
-        self.set_font_size(max(MINIMUM_FONT_SIZE, cfs - 2.0))
+        self.set_font_size(global_font_size() - 2.0)
 
     def restore_font_size(self) -> None:  # legacy
         self.set_font_size(get_options().font_size)
@@ -1700,7 +1710,7 @@ class Boss:
                             pass  # no-op
                 else:
                     new_size = amt
-                new_size = max(MINIMUM_FONT_SIZE, min(new_size, get_options().font_size * 10))
+                new_size = clamp_font_size(new_size, get_options().font_size)
             return new_size
 
         if all_windows:
@@ -1844,6 +1854,9 @@ class Boss:
         self.mappings.push_keyboard_mode(new_mode)
 
     def dispatch_possible_special_key(self, ev: KeyEvent) -> bool:
+        if (w := self.active_window) is not None and w.program_status and not is_modifier_key(ev.key):
+            # the user pressing a key in the window means they have seen its finished or failed programs
+            w.program_status_seen_by_user()
         return self.mappings.dispatch_possible_special_key(ev)
 
     def on_shortcut_key_release(self, ev: KeyEvent) -> bool:
@@ -1986,14 +1999,14 @@ class Boss:
         if overlay_window is not None:
             overlay_window.allow_remote_control = True
 
-    def resize_layout_window(self, window: Window, increment: float, is_horizontal: bool, reset: bool = False) -> bool | None | str:
+    def resize_layout_window(self, window: Window, increment: float, is_horizontal: bool, reset: bool = False, fraction: float = 0) -> bool | None | str:
         tab = window.tabref()
         if tab is None or not increment:
             return False
         if reset:
             tab.reset_window_sizes()
             return None
-        return tab.resize_window_by(window.id, increment, is_horizontal)
+        return tab.resize_window_by(window.id, increment, is_horizontal, fraction)
 
     def resize_os_window(self, os_window_id: int, width: int, height: int, unit: str, incremental: bool = False, metrics: 'None | OSWindowSize' = None) -> None:
         if not incremental and (width < 0 or height < 0):
@@ -2086,7 +2099,7 @@ class Boss:
         consumed = False
         if action_definition:
             try:
-                actions = get_options().alias_map.resolve_aliases(action_definition, 'map' if dispatch_type == 'KeyPress' else 'mouse_map')
+                actions = get_options().alias_map.resolve_aliases(action_definition, MapType.MAP if dispatch_type == 'KeyPress' else MapType.MOUSE_MAP)
             except Exception as e:
                 self.show_error('Failed to parse action', f'{action_definition}\n{e}')
                 return True
@@ -2137,21 +2150,62 @@ class Boss:
         if tm is not None:
             tm.update_tab_bar_data()
 
+    def _reset_drop_previews(self, restore_tab_drag_focus_for: TabManager | None = None) -> None:
+        "Clear drag UI state and restore pre-hover focus after a same-window tab reorder"
+        self._update_drag_over(None)
+        for q in self.all_tab_managers:
+            q.on_window_drop_move()
+            q.on_tab_drop_move()
+            q.finish_tab_drag_hover(restore_focus=q is restore_tab_drag_focus_for)
+            q.layout_tab_bar()  # ensure tab bar is fully updated
+
+    def _update_drag_over(self, tm: TabManager | None) -> None:
+        "Record which OS Window a drag is currently over, so that its tab bar stays visible"
+        for q in self.all_tab_managers:
+            q.set_drag_over_me(q is tm)
+
+    def _sole_window_of_tab(self, tab: Tab) -> Window | None:
+        "The only window in tab, if tab has a single window group (overlays of that group are allowed)"
+        return tab.active_window if tab.windows.num_groups == 1 else None
+
+    def _tab_merge_target(self, tab: Tab, tm: TabManager, x: int, y: int) -> Window | None:
+        """The window of tab that is to be inserted into the layout of tm.active_tab, if tab is
+        dropped at x, y. None if the drop should be handled as an ordinary tab drop instead.
+
+        The caller must have already made the tab bar of tm visible (see TabManager.set_drag_over_me)
+        as otherwise the central region measured here is not the one the drop will use."""
+        dest_tab = tm.active_tab
+        if dest_tab is None or dest_tab is tab or (window := self._sole_window_of_tab(tab)) is None:
+            return None
+        central = viewport_for_window(tm.os_window_id)[0]
+        if not (central.left <= x < central.right and central.top <= y < central.bottom):
+            return None
+        return window
+
     def on_drop_move(self, os_window_id: int, x: int, y: int, from_self: bool, is_leave: bool) -> None:
         if (tm := self.os_window_map.get(os_window_id)) is None:
             return
         if from_self:
             tab_id, drag_started = get_tab_being_dragged()[:2]
             if tab_id and drag_started and (tab := self.tab_for_id(tab_id)):
-                central, tab_bar = viewport_for_window(os_window_id)[:2]
+                # Settle the tab bar visibility of the destination before measuring its
+                # regions. Doing it the other way around makes the central region shrink
+                # as a side effect of classifying the drop, which then re-classifies the
+                # same pointer position differently on the next drag move event.
+                self._update_drag_over(None if is_leave else tm)
+                tab_bar = viewport_for_window(os_window_id)[1]
                 in_tab_bar = tab_bar.left <= x < tab_bar.right and tab_bar.top <= y < tab_bar.bottom
                 detach = not in_tab_bar or tab.os_window_id != tm.os_window_id or is_leave
                 change_drag_thumbnail(tab.os_window_id, 1 if detach else 0)
+                merge_window = None if is_leave else self._tab_merge_target(tab, tm, x, y)
+                merge_window_id = merge_window.id if merge_window is not None else 0
                 for q in self.all_tab_managers:
-                    is_dest = q is tm and (in_tab_bar or os_window_id != tab.os_window_id) and not is_leave
+                    q.on_window_drop_move(merge_window_id, merge_window is not None and q is tm, x, y)
+                    is_dest = merge_window is None and q is tm and (in_tab_bar or os_window_id != tab.os_window_id) and not is_leave
                     q.on_tab_drop_move(tab_id, is_dest, x, y)
             window_id, drag_started = get_window_being_dragged()[:2]
             if window_id and drag_started:
+                self._update_drag_over(None if is_leave else tm)
                 for q in self.all_tab_managers:
                     q.on_window_drop_move(window_id, (not is_leave) and (q is tm), x, y)
 
@@ -2172,26 +2226,27 @@ class Boss:
             window_id = int(widb)
             tm.on_window_drop(x, y, window_id)
             set_window_being_dragged()
-            for q in self.all_tab_managers:
-                q.on_window_drop_move()
+            self._reset_drop_previews()
             return
         if (tidb := drop.get(f'application/net.kovidgoyal.kitty-tab-{os.getpid()}')) and (tab := self.tab_for_id(int(tidb))):
-            central, tab_bar = viewport_for_window(os_window_id)[:2]
+            tab_bar = viewport_for_window(os_window_id)[1]
             in_tab_bar = tab_bar.left <= x < tab_bar.right and tab_bar.top <= y < tab_bar.bottom
-            if in_tab_bar or tab.os_window_id != tm.os_window_id:
+            restore_tab_drag_focus_for = None
+            if (merge_window := self._tab_merge_target(tab, tm, x, y)) is not None:
+                tm.on_window_drop(x, y, merge_window.id)
+            elif in_tab_bar or tab.os_window_id != tm.os_window_id:
+                if in_tab_bar and tab.os_window_id == tm.os_window_id:
+                    restore_tab_drag_focus_for = tm
                 tm.on_tab_drop(x, y)
             else:
                 self._move_tab_to(tab)
             set_tab_being_dragged()
-            for tm in self.all_tab_managers:
-                tm.on_tab_drop_move()
-                tm.layout_tab_bar()  # ensure tab bar is fully updated
+            self._reset_drop_previews(restore_tab_drag_focus_for)
             return
         central, tab_bar = viewport_for_window(os_window_id)[:2]
         if central.left <= x < central.right and central.top <= y < central.bottom:
-            x -= central.left
-            y -= central.top
             if tab := tm.active_tab:
+                # Window geometry is already relative to the OS window.
                 for window in tab:
                     if window.is_visible_in_layout:
                         g = window.geometry
@@ -2201,6 +2256,21 @@ class Boss:
         elif tab_bar.left <= x < tab_bar.right and tab_bar.top <= y < tab_bar.bottom:
             if (tab_id := tm.tab_bar.tab_id_at(x, y)) and (tab := self.tab_for_id(tab_id)) and (w := tab.active_window):
                 w.on_drop(drop)
+
+    def dropped_file_promises_dir(self, path: str) -> None:
+        # Called by the C code on macOS with the temporary directory holding the
+        # files a drop of file promises was fulfilled into. Their paths are what
+        # is given to the program running in the window, so the files must
+        # outlive the drop. Keep them around for a while, ensuring they are
+        # removed even if kitty is killed before that.
+        self.atexit.rmtree(path)
+
+        def remove_dropped_files(timer_id: int | None) -> None:
+            import shutil
+
+            shutil.rmtree(path, ignore_errors=True)
+
+        add_timer(remove_dropped_files, DROPPED_FILE_PROMISES_LIFETIME, False)
 
     def on_drag_source_finished(
         self, was_dropped: bool, was_canceled: bool, accepted_mime_type: str, action: int, data: dict[str, bytes] | None, needs_toplevel_on_wayland: bool
@@ -2216,6 +2286,7 @@ class Boss:
                             t.force_show_title_bars = False
                             t.relayout()
                 set_window_being_dragged()
+                self._update_drag_over(None)
                 for tm in self.all_tab_managers:
                     tm.on_window_drop_move()
                 if was_dropped and not was_canceled:
@@ -2228,16 +2299,43 @@ class Boss:
             return
         if (tab_id := int((data or {}).get(f'application/net.kovidgoyal.kitty-tab-{os.getpid()}', b'0').decode())) and get_tab_being_dragged()[0] == tab_id:
             tab = self.tab_for_id(tab_id)
-            if tab is not None and needs_toplevel_on_wayland:
+            # The native callback reports was_dropped=False for internal drops.
+            # Wayland can finish the source before delivering the destination's
+            # data, so complete its pending UI target unless the drag was canceled.
+            if not was_canceled and tab is not None and needs_toplevel_on_wayland:
                 for tm in self.all_tab_managers:
+                    target = tm.window_being_dropped
+                    if (
+                        target is not None
+                        and (window := self._sole_window_of_tab(tab)) is not None
+                        and (dest_window := self.window_id_map.get(target.window_id)) is not None
+                    ):
+                        # target.direction is resolved when the preview is drawn, as the quadrant
+                        # alone does not determine it (quadrant 6 highlights the whole window).
+                        if target.direction is None:
+                            self._move_window_to(window, target_tab_id=dest_window.tab_id)
+                        else:
+                            self._insert_window_in_direction(window, dest_window, target.direction)
+                        set_tab_being_dragged()
+                        self._reset_drop_previews()
+                        return
                     if tm.tab_being_dropped:
+                        restore_tab_drag_focus_for = tm if tab.os_window_id == tm.os_window_id else None
                         tm.on_tab_drop(0, 0, bypass_move=True)
+                        self._reset_drop_previews(restore_tab_drag_focus_for)
                         return
             set_tab_being_dragged()
+            self._update_drag_over(None)
             for tm in self.all_tab_managers:
+                tm.on_window_drop_move()
                 tm.on_tab_drop_move()
-            if was_dropped and tab is not None:  # detach tab into new OS Window
+            if was_dropped and not was_canceled and tab is not None:  # detach tab into new OS Window
                 self._move_tab_to(tab)
+            # Cocoa can finish an internal drag before on_drop receives its data.
+            # Keep the saved focus until that callback classifies the actual drop.
+            if was_canceled or was_dropped or needs_toplevel_on_wayland:
+                for tm in self.all_tab_managers:
+                    tm.finish_tab_drag_hover(restore_focus=False)
 
     @ac(
         'win',
@@ -2487,7 +2585,7 @@ class Boss:
         action_on_removal: Callable[[int, 'Boss'], None] | None = None,
         default_data: dict[str, Any] | None = None,
     ) -> Any:
-        from kittens.runner import CLIOnlyKitten, KittenMetadata, create_kitten_handler
+        from kittens.runner import CLIOnlyKitten, KittenMetadata, create_kitten_handler, resolved_kitten
 
         is_wrapped = kitten in wrapped_kitten_names()
         if window is None:
@@ -2496,6 +2594,21 @@ class Boss:
         else:
             w = window
             tab = w.tabref() if w else None
+        resize_session = None
+        if w is not None and tab is not None and resolved_kitten(kitten) == 'resize_window':
+            group = tab.windows.group_for_window(w)
+            if group is not None:
+                for i, overlay in enumerate(group.windows):
+                    if i and overlay.is_resize_overlay:
+                        # Replace the existing resize UI so that the options for
+                        # this invocation take effect, but keep its snapshot of
+                        # the sizes from when resize mode was first opened.
+                        from .rc.resize_window_edge import resize_window_edge
+
+                        resize_session = resize_window_edge.sessions.pop(overlay, None)
+                        w = group.windows[i - 1]
+                        self.mark_window_for_close(overlay)
+                        break
         args = list(args)
         if w is not None and '@selection' in args and (sel := self.data_for_at(which='@selection', window=w)):
             args = [sel if xa == '@selection' else xa for xa in args]
@@ -2579,6 +2692,14 @@ class Boss:
             wid = w.id
             overlay_window.actions_on_close.append(partial(self.on_kitten_finish, wid, custom_callback or end_kitten.handle_result, default_data=default_data))
             overlay_window.open_url_handler = end_kitten.open_url_handler
+            if resolved_kitten(kitten) == 'resize_window':
+                # The resize kitten sends commands over the overlay's terminal.
+                # Also allow it when launched directly with configurable options.
+                overlay_window.allow_remote_control = True
+                overlay_window.is_resize_overlay = True
+                from .rc.resize_window_edge import resize_window_edge
+
+                resize_window_edge.start_session(overlay_window, tab.current_layout, resize_session)
             if action_on_removal is not None:
 
                 def callback_wrapper(*a: Any) -> None:
@@ -2703,6 +2824,12 @@ class Boss:
             if w is not None and tab is not None:
                 tab.new_special_window(self.create_special_window_for_show_error(title, msg, w.id), copy_colors_from=w)
 
+    def show_custom_shader_errors(self) -> None:
+        errors = load_shader_programs.custom_shader_errors
+        if errors:
+            load_shader_programs.custom_shader_errors = []
+            self.show_error(_('Failed to load custom shaders'), '\n\n'.join(errors))
+
     @ac('mk', 'Create a new marker')
     def create_marker(self) -> None:
         w = self.window_for_dispatch or self.active_window
@@ -2798,22 +2925,29 @@ class Boss:
         return False
 
     def drag_resize_update(self, x: float, y: float) -> None:
+        # Truncate towards zero rather than flooring, so that the pointer has to
+        # travel a full cell away from where the drag started before anything moves
+        # and coming back to the start always restores the original layout exactly.
+        # last_step_* counts the cells actually applied, which is not necessarily the
+        # number requested, since the layout stops at minimum sizes. Accumulating the
+        # applied amount keeps the divider locked to the pointer when it comes back
+        # out of a minimum, instead of leaving it lagging by however much was refused.
         if not (r := self.drag_resize_of_window) or not (tab := self.tab_for_id(r.tab_id)):
             return
         if (h := r.data.horizontal_id) is not None:
             mult = 1 if r.data.width_increases_rightwards else -1
-            step_x = floor((x - r.initial_x) / r.cell_width) * mult
+            step_x = int((x - r.initial_x) / r.cell_width) * mult
             dx = step_x - r.last_step_x
             if dx != 0:
-                if tab.drag_resize_window(h, float(dx), True):
-                    self.drag_resize_of_window = r._replace(last_step_x=step_x)
+                if applied := tab.drag_resize_window(h, dx, True):
+                    self.drag_resize_of_window = r = r._replace(last_step_x=r.last_step_x + applied)
         if (v := r.data.vertical_id) is not None:
             mult = 1 if r.data.height_increases_downwards else -1
-            step_y = floor((y - r.initial_y) / r.cell_height) * mult
+            step_y = int((y - r.initial_y) / r.cell_height) * mult
             dy = step_y - r.last_step_y
             if dy != 0:
-                if tab.drag_resize_window(v, float(dy), False):
-                    self.drag_resize_of_window = r._replace(last_step_y=step_y)
+                if applied := tab.drag_resize_window(v, dy, False):
+                    self.drag_resize_of_window = r._replace(last_step_y=r.last_step_y + applied)
 
     def drag_resize_end(self) -> None:
         if tab := self.tab_for_id(self.drag_resize_of_window.tab_id):
@@ -2825,13 +2959,14 @@ class Boss:
         self.open_url(website_url())
 
     @ac('misc', 'Open the specified URL')
-    def open_url(self, url: str, program: str | list[str] | None = None, cwd: str | None = None) -> None:
+    def open_url(self, url: str | list[str], program: str | list[str] | None = None, cwd: str | None = None) -> None:
         if not url:
             return
         if isinstance(program, str):
             program = to_cmdline(program)
         found_action = False
         if program is None:
+            assert isinstance(url, str)
             from .open_actions import actions_for_url
 
             actions = list(actions_for_url(url))
@@ -3223,10 +3358,11 @@ class Boss:
 
     def _new_tab(self, args: SpecialWindowInstance | Iterable[str], cwd_from: CwdRequest | None = None, as_neighbor: bool = False) -> Tab | None:
         special_window = None
-        if args:
-            if isinstance(args, SpecialWindowInstance):
-                special_window = args
-            else:
+        if isinstance(args, SpecialWindowInstance):
+            special_window = args
+        else:
+            args = tuple(args)
+            if args:
                 special_window = self.args_to_special_window(args, cwd_from=cwd_from)
         if not self.os_window_map:
             self.add_os_window()
@@ -3469,6 +3605,9 @@ class Boss:
             with suppress(FileNotFoundError):
                 os.remove(path)
 
+    def is_ok_to_read_image_path(self, path: str) -> bool:
+        return is_ok_to_read_image_path(path)
+
     def is_ok_to_read_image_file(self, path: str, fd: int) -> bool:
         return is_ok_to_read_image_file(path, fd)
 
@@ -3524,7 +3663,7 @@ class Boss:
             if file:
                 a(f'In file {file}:')
             [a(format_bad_line(x)) for x in groups[file]]
-        if misc_errors:
+        if misc_errors := tuple(misc_errors):
             a('In final effective configuration:')
             for line in misc_errors:
                 a(line)
@@ -3559,7 +3698,14 @@ class Boss:
         pd = cast(dict[str, Any], payload if isinstance(payload, dict) else {})
         c.response_from_kitty(self, self.window_for_dispatch or self.active_window, PayloadGetter(c, pd))
 
-    def _move_window_to(self, window: Window | None = None, target_tab_id: str | int | None = None, target_os_window_id: str | int | None = None) -> None:
+    def _move_window_to(
+        self,
+        window: Window | None = None,
+        target_tab_id: str | int | None = None,
+        target_os_window_id: str | int | None = None,
+        new_tab_title: str = '',
+        new_tab_location: str = '',
+    ) -> None:
         window = window or self.active_window
         if not window:
             return
@@ -3570,7 +3716,7 @@ class Boss:
             if target_os_window_id == 'new':
                 target_os_window_id = self.add_os_window()
                 tm = self.os_window_map[target_os_window_id]
-                target_tab = tm.new_tab(empty_tab=True)
+                target_tab = tm.new_tab(empty_tab=True, title=new_tab_title)
             else:
                 target_os_window_id = target_os_window_id or current_os_window()
                 if isinstance(target_tab_id, str):
@@ -3582,7 +3728,7 @@ class Boss:
                         tm = self.os_window_map[target_os_window_id]
                     if target_tab_id.startswith('new'):
                         # valid values for target_tab_id are 'new', 'new_after' and 'new_before'
-                        target_tab = tm.new_tab(empty_tab=True, location=(target_tab_id[4:] or 'last'))
+                        target_tab = tm.new_tab(empty_tab=True, location=(new_tab_location or target_tab_id[4:] or 'last'), title=new_tab_title)
                     else:
                         target_tab = tm.tab_at_location(target_tab_id) or tm.new_tab(empty_tab=True)
                 else:
@@ -3610,29 +3756,21 @@ class Boss:
             tab.current_layout.move_window_to_group(tab.windows, wg_b.id)
             tab.relayout()
 
-    def _insert_window_in_direction(
-        self,
-        window: Window,
-        dest_window: Window,
-        direction: Literal['left', 'right', 'top', 'bottom'],
-    ) -> None:
+    def _insert_window_in_direction(self, window: Window, dest_window: Window, direction: DropDirection) -> None:
         src_tab = window.tabref()
         dest_tab = dest_window.tabref()
         if src_tab is None or dest_tab is None:
             return
+        horizontal = direction in ('left', 'right')
+        after = direction in ('right', 'bottom')
         with self.suppress_focus_change_events():
-            if src_tab is not dest_tab:
-                target_tab_id = dest_tab.id
-                self._move_window_to(window, target_tab_id=target_tab_id)
-                dest_tab_fresh = self.tab_for_id(dest_tab.id)
-                if dest_tab_fresh is None:
-                    return
-                src_tab = dest_tab_fresh
-            layout = src_tab.current_layout
-            horizontal = direction in ('left', 'right')
-            after = direction in ('right', 'bottom')
-            layout.insert_window_next_to(src_tab.windows, window, dest_window, horizontal, after)
-            src_tab.relayout()
+            if src_tab is dest_tab:
+                src_tab.current_layout.insert_window_next_to(src_tab.windows, window, dest_window, horizontal, after)
+                src_tab.relayout()
+                return
+            dest_tab.attach_windows(src_tab.detach_window(window), next_to=dest_window, horizontal=horizontal, after=after)
+            self._cleanup_tab_after_window_removal(src_tab)
+            dest_tab.make_active()
 
     def _move_tab_to(self, tab: Tab | None = None, target_os_window_id: int | None = None) -> Tab | None:
         tab = tab or self.active_tab
@@ -3768,6 +3906,8 @@ class Boss:
         """,
     )
     def detach_window(self, *args: str) -> None:
+        if args and args[0].startswith('-'):
+            return self.remote_control('detach-window', *args)
         if not args or args[0] == 'new':
             return self._move_window_to(target_os_window_id='new')
         if args[0] in ('new-tab', 'tab-prev', 'tab-left', 'tab-right', 'new-tab-left', 'new-tab-right'):

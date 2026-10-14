@@ -21,6 +21,7 @@ from kitty.config import finalize_keys, finalize_mouse_mappings
 from kitty.fast_data_types import TEXT_SIZE_CODE, Cursor, HistoryBuf, LineBuf, Screen, get_options, monotonic, set_options
 from kitty.options.parse import merge_result_dicts
 from kitty.options.types import Options, defaults
+from kitty.options.utils import mouse_wheel_buttons
 from kitty.rgb import to_color
 from kitty.types import MouseEvent
 from kitty.utils import read_screen_size
@@ -66,6 +67,7 @@ class Callbacks:
             self.pty.reset_termios_state()
 
     def color_control(self, code, data) -> None:
+        from kitty.fast_data_types import base64_decode
         from kitty.window import color_control
 
         response = color_control(self.color_profile, code, data)
@@ -79,7 +81,14 @@ class Callbacks:
                     ans = x
                 return ans
 
-            parts = {x.partition('=')[0]: p(x.partition('=')[2]) for x in response.split(';')[1:]}
+            parts = {}
+            for x in response.split(';')[1:]:
+                k, _, v = x.partition('=')
+                if k == 'unknown':
+                    # unknown field names are base64 encoded, collect the decoded names in a list
+                    parts.setdefault('unknown', []).append(base64_decode(v).decode('ascii'))
+                else:
+                    parts[k] = p(v)
             self.color_control_responses.append(parts)
 
     def title_changed(self, data, is_base64=False) -> None:
@@ -87,6 +96,9 @@ class Callbacks:
 
     def osc_context(self, data):
         pass
+
+    def program_status_report(self, data):
+        self.program_status_reports.append(str(data, 'utf-8'))
 
     def icon_changed(self, data) -> None:
         self.iconbuf += str(data, 'utf-8')
@@ -135,6 +147,7 @@ class Callbacks:
         self.printbuf = []
         self.color_control_responses = []
         self.notifications = []
+        self.program_status_reports = []
         self.open_urls = []
         self.cc_buf = []
         self.bell_count = 0
@@ -167,14 +180,18 @@ class Callbacks:
         pass
 
     def on_mouse_event(self, event):
+        steps = 1
+        if event['button'] in mouse_wheel_buttons:  # repeat_count is the number of wheel steps
+            steps, event['repeat_count'] = event['repeat_count'], 1
         ev = MouseEvent(**event)
         opts = get_options()
         action_def = opts.mousemap.get(ev)
         if not action_def:
             return False
         self.current_mouse_button = ev.button
-        for action in opts.alias_map.resolve_aliases(action_def, 'mouse_map'):
-            getattr(self, action.func)(*action.args)
+        for _ in range(steps):
+            for action in opts.alias_map.resolve_aliases(action_def, 'mouse_map'):
+                getattr(self, action.func)(*action.args)
         self.current_mouse_button = 0
         return True
 

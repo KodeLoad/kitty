@@ -140,7 +140,7 @@ def log_error(*a: Any, **k: str) -> None:
 
 
 @contextmanager
-def suppress_error_logging() -> Iterator[None]:
+def suppress_error_logging() -> Generator[None, None, None]:
     before = getattr(log_error, 'redirect', suppress_error_logging)
     setattr(log_error, 'redirect', lambda *a: None)
     try:
@@ -271,7 +271,7 @@ def open_cmd(
     )
 
 
-def open_url(url: str, program: str | list[str] = 'default', cwd: str | None = None, extra_env: dict[str, str] | None = None) -> 'PopenType[bytes]':
+def open_url(url: str | list[str], program: str | list[str] = 'default', cwd: str | None = None, extra_env: dict[str, str] | None = None) -> 'PopenType[bytes]':
     return open_cmd(command_for_open(program), url, cwd=cwd, extra_env=extra_env)
 
 
@@ -504,7 +504,7 @@ def set_echo(fd: int = -1, on: bool = False) -> tuple[int, list[int | list[bytes
 
 
 @contextmanager
-def no_echo(fd: int = -1) -> Iterator[None]:
+def no_echo(fd: int = -1) -> Generator[None, None, None]:
     import termios
 
     fd, old = set_echo(fd)
@@ -514,15 +514,13 @@ def no_echo(fd: int = -1) -> Iterator[None]:
         termios.tcsetattr(fd, termios.TCSADRAIN, old)
 
 
+def natsort_key(text: str, case_sensitive: bool = True) -> tuple[tuple[int, str], ...]:
+    # re.split() with a capturing group puts the digit runs at the odd indices
+    return tuple((int(x), x) if i % 2 else (0, x if case_sensitive else x.casefold()) for i, x in enumerate(re.split(r'(\d+)', text)))
+
+
 def natsort_ints(iterable: Iterable[str]) -> list[str]:
-
-    def convert(text: str) -> int | str:
-        return int(text) if text.isdigit() else text
-
-    def alphanum_key(key: str) -> tuple[int | str, ...]:
-        return tuple(map(convert, re.split(r'(\d+)', key)))
-
-    return sorted(iterable, key=alphanum_key)
+    return sorted(iterable, key=natsort_key)
 
 
 def get_hostname(fallback: str = '') -> str:
@@ -644,9 +642,37 @@ def is_path_in_temp_dir(path: str) -> bool:
     return False
 
 
+def is_ok_to_read_image_path(path: str) -> bool:
+    """Check if path may be read, based only on the path itself.
+
+    This must be done *before* opening the file, since merely opening a file
+    can have side effects and the success or failure of the open leaks the
+    existence of the file to the, possibly remote or sandboxed, client.
+    """
+    if not path:
+        return False
+    path = os.path.abspath(os.path.realpath(path))
+    parts = path.split(os.sep)[1:]
+    if len(parts) < 1:
+        return False
+    if parts[0] in ('sys', 'proc', 'dev'):
+        if parts[0] == 'dev':
+            return len(parts) > 2 and parts[1] == 'shm'
+        return False
+    return True
+
+
 def is_ok_to_read_image_file(path: str, fd: int) -> bool:
+    """Check if the already opened fd for path may be read.
+
+    This re-does the path based checks, since path could have been swapped for
+    a different file after :func:`is_ok_to_read_image_path` was called, and
+    additionally verifies that the opened file is a regular file.
+    """
     import stat
 
+    if not is_ok_to_read_image_path(path):
+        return False
     path = os.path.abspath(os.path.realpath(path))
     try:
         path_stat = os.stat(path, follow_symlinks=True)
@@ -654,13 +680,6 @@ def is_ok_to_read_image_file(path: str, fd: int) -> bool:
     except OSError:
         return False
     if not os.path.samestat(path_stat, fd_stat):
-        return False
-    parts = path.split(os.sep)[1:]
-    if len(parts) < 1:
-        return False
-    if parts[0] in ('sys', 'proc', 'dev'):
-        if parts[0] == 'dev':
-            return len(parts) > 2 and parts[1] == 'shm'
         return False
     return stat.S_ISREG(fd_stat.st_mode)
 
@@ -1217,12 +1236,21 @@ def unlock_file(f: IO[bytes] | IO[str]) -> None:
 
 
 @contextmanager
-def lock_with_file(path: str) -> Iterator[None]:
-    os.close(os.open(path, os.O_CREAT | os.O_WRONLY | os.O_EXCL | os.O_CLOEXEC))
+def lock_with_file(path: str) -> Generator[None, None, None]:
+    """Take an exclusive advisory lock on path, waiting for it to become available.
+
+    The lock file is created if needed and left in place, since unlinking it
+    would allow a second process to create and lock a different file with the
+    same name while the lock is still held. The kernel drops the lock when the
+    file descriptor is closed, including on abnormal process exit, so stale lock
+    files are harmless.
+    """
+    fd = os.open(path, os.O_CREAT | os.O_WRONLY | os.O_CLOEXEC, 0o600)
     try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
         yield
     finally:
-        os.remove(path)
+        os.close(fd)
 
 
 def rmtree_best_effort(relpath: str, dir_fd: int) -> None:

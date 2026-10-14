@@ -159,7 +159,7 @@ class CurrentlyParsing:
         return CurrentlyParsing(self.line, self.number, self.file)
 
     @contextmanager
-    def set_line(self, line: str, number: int) -> Iterator['CurrentlyParsing']:
+    def set_line(self, line: str, number: int) -> Generator['CurrentlyParsing', None, None]:
         orig = self.line, self.number
         self.line = line
         self.number = number
@@ -169,7 +169,7 @@ class CurrentlyParsing:
             self.line, self.number = orig
 
     @contextmanager
-    def set_file(self, file: str) -> Iterator['CurrentlyParsing']:
+    def set_file(self, file: str) -> Generator['CurrentlyParsing', None, None]:
         orig = self.file
         self.file = file
         try:
@@ -557,7 +557,7 @@ def parse_kittens_key(val: str, funcs_with_args: dict[str, KeyFunc[tuple[str, An
 def uniq(vals: Iterable[T]) -> list[T]:
     seen: set[T] = set()
     seen_add = seen.add
-    return [x for x in vals if x not in seen and not seen_add(x)]
+    return [x for x in vals if x not in seen and not seen_add(x)]  # ty: ignore[redundant-condition]
 
 
 def save_type_stub(text: str, fpath: str) -> None:

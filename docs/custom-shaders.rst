@@ -29,6 +29,20 @@ Cursor trails
 You must have enabled cursor trails with something like ``cursor_trail 1`` in :file:`kitty.conf` for
 these shaders to take effect.
 
+When the cursor moves quickly, the trail can appear to hop from place to place
+instead of gliding. The ``cursor-trail-motion-blur`` shader smooths this out
+the way a camera does, by blurring the trail slightly along the direction it
+is moving, and it also smooths the trail's jagged edges. Enable it with
+:code:`custom_shaders cursor-trail-motion-blur`. The options it supports are
+explained at the top of the :repo_file:`shader file
+<kitty/shaders/custom/cursor-trail-motion-blur.slang>`.
+
+The ``cursor-trail-railgun``, ``cursor-trail-torpedo`` and
+``cursor-trail-pixiedust`` shaders make particles fly off the cursor as it
+moves, in the style of `neovide <https://neovide.dev>`__. You can change the
+size, speed, color, lifetime, etc. of the particles, as explained at the top of
+the :repo_file:`shader file <kitty/shaders/custom/cursor-trail-particles.slang>`.
+
 .. include:: generated/custom-shaders-cursor-trails.rst
 
 Animated backgrounds
@@ -55,7 +69,7 @@ Customising and composing shaders
 -----------------------------------
 
 While you can always customise the shader by editing the shader itself, this is
-overkill. Often shader declare parameters that you can tune to customise their
+overkill. Often shaders declare parameters that you can tune to customise their
 appearance. If you open the shader file such parameters are often declared near
 the top as ``static const`` variables. You can customise these using pipeline
 files without needing to edit the shader itself. You can also compose multiple
@@ -78,6 +92,31 @@ This pipeline combines two shaders, the ``crt`` shader and the ``spotlight`` on
 mouse shader. In the first group we have the crt shader and its color has been
 customised. The second group defines the spotlight shader and specifies exactly
 when the spotlight animation should start and stop.
+
+As another example, to blend inactive windows toward gray instead of black, save the
+following as :file:`shaders/dim-gray.pipeline` in your kitty config directory and
+set ``custom_shaders dim-gray`` and ``inactive_text_alpha 1`` in :file:`kitty.conf`::
+
+    startgroup
+        animation_step 0
+        var float HIGHLIGHT_INTENSITY = 0
+        var float BORDER_WIDTH = 0
+        var float INACTIVE_DIM = 0.74
+        var float3 INACTIVE_DIM_COLOR = float3(0.2158605)
+        var bool DIM_CENTRAL_AREA_ONLY = true
+        var bool INCLUDE_WINDOW_PADDING = true
+        shaders focus-highlight
+    endgroup
+
+This uses the same shader as ``dim-inactive-windows``. ``INACTIVE_DIM`` is the
+fraction of the original color retained: ``0.74`` blends in 26% of the target
+color. ``INACTIVE_DIM_COLOR`` is in linear RGB; ``0.2158605`` corresponds to
+sRGB ``#808080``. The default target is black, preserving the existing dimming
+effect. The two optional flags preserve the tab bar and include the active
+window's title bar, margin, border and padding in its unchanged area. Explicit cell backgrounds
+and images are blended together with text, while transparency and colors reported to
+terminal applications are preserved. ``animation_step 0`` makes this static
+effect redraw only when content or shader events change.
 
 
 Anatomy of a custom shader
@@ -134,6 +173,37 @@ The two structs passed into this function have the definition shown below:
    :end-before: END_TYPES_DEFINITION
 
 Shaders take their inputs and use them to transform the color as they see fit.
+
+.. _custom_shader_pointer_map:
+
+Shaders that move content
+__________________________
+
+A shader that draws content somewhere other than where kitty put it, such as
+the ``crt`` shader curving the screen, makes the mouse pointer and the text
+under it disagree, so that clicks and selections land on the wrong cells. To
+fix that, the shader can also define a function that tells kitty where the
+content shown at a given position actually is::
+
+    public float2
+    pointer_map(float2 pos, KittyCustomShaderData d) {
+        return warp(pos);  // the same function fragment_main() uses to sample the backbuffer
+    }
+
+``pos`` and the return value are in the same UV co-ordinates as ``t.pos``.
+The function must be ``public`` and return ``float2``. kitty evaluates it on a
+grid only when the pipeline is loaded and when the OS Window is resized, and
+uses it to move all pointer events, so the only field of ``d`` it may use is
+``d.viewport_size_pixels``. Only shaders in groups that draw to the whole
+screen and are always active, that is, without ``animation_start``,
+``attach``, ``output_texture``, ``viewport_pos`` or ``viewport_size``, are
+used, since only they move content permanently. When several shaders define
+it, they are applied starting from the last one to run.
+
+Note that :code:`d.mouse_pos` then contains the mapped position, that is, the
+position of the content under the mouse before it was moved. Effects that draw
+at the mouse position line up with the pointer when they run before the shader
+that moves content, not after it.
 
 .. _custom_shader_pipeline:
 
@@ -246,7 +316,9 @@ Directives inside a group:
     How many milliseconds between animation frames. Lower values produce
     smoother animation at the cost of more GPU draws. Defaults to ``50`` ms
     (20 fps). The value is clamped to be no smaller than
-    :opt:`repaint_delay`.
+    :opt:`repaint_delay`. Set this to ``0`` for static effects that should
+    redraw only when content or shader events change, without periodic frames.
+    Animation stop events and duration limits still apply.
 
 ``attach``
     Mark this group as *attached* to the preceding group. An attached group
@@ -284,11 +356,15 @@ the pipeline via the ``KittyTextures`` struct (``t.a``, ``t.b``, ``t.persist``).
     frame *N+1*. This allows effects that accumulate state over time (e.g.
     simulation steps, trails, fluid simulations).
 
-All three named textures have the same pixel dimensions as the OS window
-viewport. They must be declared in the top-level ``textures`` directive before
-they can be referenced. A named texture that is the output target for the
-current group cannot simultaneously be sampled as input; kitty automatically
-substitutes the backbuffer in that case.
+All three named textures cover the same area as the OS Window viewport and are
+sampled in the same UV co-ordinate space as ``t.pos``, via the ``Sample()``
+method on ``KittyTexture``. Note that the underlying GPU textures can be larger
+than the viewport, since kitty grows them to fit the largest OS Window and
+never shrinks them again, so always sample via ``Sample()`` rather than using
+the raw ``tex`` sampler. They must be declared in the top-level ``textures``
+directive before they can be referenced. A named texture that is the output
+target for the current group cannot simultaneously be sampled as input; kitty
+automatically substitutes the backbuffer in that case.
 
 **How groups chain together**
 

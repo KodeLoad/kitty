@@ -12,7 +12,7 @@ import sys
 import time
 import unittest
 from collections.abc import Callable, Generator, Iterator, Sequence
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from functools import lru_cache
 from tempfile import TemporaryDirectory, mkdtemp
 from typing import (
@@ -165,7 +165,9 @@ class GoProc:
         os.mkdir(env['XDG_CONFIG_HOME'])
         env['XDG_CACHE_HOME'] = self.tdir + '/cache'
         os.mkdir(env['XDG_CACHE_HOME'])
-        self.proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=env)
+        # start_new_session so that go tests cannot touch the terminal the
+        # test suite is being run from, see detach_from_controlling_terminal()
+        self.proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=env, stdin=subprocess.DEVNULL, start_new_session=True)
         self.stdout_fd = self.proc.stdout.fileno()
 
     @property
@@ -189,8 +191,8 @@ def run_go(packages: set[str], names: Sequence[str]) -> GoProc:
     go = go_exe()
     go_pkg_args = [f'github.com/kovidgoyal/kitty/{x}' for x in packages]
     cmd = [go, 'test', '--tags', 'testing', '-v', '-json']
-    for name in names:
-        cmd.extend(('-run', name))
+    if names:
+        cmd.extend(('-run', '^Test(?:' + '|'.join(re.escape(name) for name in names) + ')$'))
     cmd += go_pkg_args
     return GoProc(cmd)
 
@@ -223,21 +225,31 @@ def env_vars(**kw: str) -> Iterator[None]:
                 os.environ[k] = v
 
 
-@contextmanager
-def env_for_python_tests(report_env: bool = False) -> Iterator[None]:
-    gohome = os.path.expanduser('~/go')
-    slangc = os.environ.get('SLANGC') or shutil.which('slangc') or 'slangc'
+def path_for_python_tests() -> str:
+    """The PATH used by tests: the built launcher dir followed by all entries not under the real home dir."""
+    from kitty.constants import kitty_exe
+
     current_home = os.path.expanduser('~') + os.sep
     paths = os.environ.get('PATH', '/usr/local/sbin:/usr/local/bin:/usr/bin').split(os.pathsep)
     path = os.pathsep.join(x for x in paths if not x.startswith(current_home))
-    launcher_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'kitty', 'launcher')
-    path = f'{launcher_dir}{os.pathsep}{path}'
-    if report_env:
-        print('Running under CI:', is_ci)
-        print('Using PATH in test environment:', path)
-        from kitty.fast_data_types import has_avx2, has_avx512, has_sse4_2
+    launcher_dir = os.path.dirname(kitty_exe())
+    return f'{launcher_dir}{os.pathsep}{path}'
 
-        print(f'Intrinsics: {has_avx512=} {has_avx2=} {has_sse4_2=}')
+
+def report_test_env() -> None:
+    """Print details of the environment tests will run in. Called once in the master process as workers have their stdout captured."""
+    print('Running under CI:', is_ci)
+    print('Using PATH in test environment:', path_for_python_tests())
+    from kitty.fast_data_types import has_avx2, has_avx512, has_sse4_2
+
+    print(f'Intrinsics: {has_avx512=} {has_avx2=} {has_sse4_2=}')
+
+
+@contextmanager
+def env_for_python_tests() -> Iterator[None]:
+    gohome = os.path.expanduser('~/go')
+    slangc = os.environ.get('SLANGC') or shutil.which('slangc') or 'slangc'
+    path = path_for_python_tests()
     with (
         TemporaryDirectory() as tdir,
         env_vars(
@@ -341,6 +353,21 @@ def run_test_worker(tests: list[unittest.TestCase], write_fd: int) -> None:
     os._exit(exit_code)
 
 
+def detach_from_controlling_terminal() -> None:
+    """Put the calling process into its own session, with no controlling terminal.
+
+    Tests must never depend on the terminal the test suite happens to be run
+    from, and must never be able to disturb it. Without this, any program a
+    test runs can reach it via /dev/tty; a job control aware shell for instance
+    will make its own process group the foreground one on it, and a second such
+    shell started while that is the case stops the entire test run with SIGTTIN.
+    """
+    try:
+        os.setsid()
+    except OSError:  # already a session leader
+        pass
+
+
 def fork_test_workers(tests: list[unittest.TestCase]) -> tuple[list[int], list[int]]:
     """Chunk tests and fork worker processes. Returns (pids, read_fds)."""
     n = min(os.cpu_count() or 4, 8, len(tests))
@@ -355,7 +382,9 @@ def fork_test_workers(tests: list[unittest.TestCase]) -> tuple[list[int], list[i
         pid = os.fork()
         if pid == 0:
             os.close(r)
-            devnull = os.open(os.devnull, os.O_WRONLY)
+            detach_from_controlling_terminal()
+            devnull = os.open(os.devnull, os.O_RDWR)
+            os.dup2(devnull, 0)
             os.dup2(devnull, 1)
             os.dup2(devnull, 2)
             os.close(devnull)
@@ -402,6 +431,7 @@ def spawn_test_workers(tests: list[unittest.TestCase]) -> tuple[list[subprocess.
             stdin=subprocess.PIPE,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
+            start_new_session=True,  # see detach_from_controlling_terminal()
         )
         os.close(w)
         assert proc.stdin is not None
@@ -448,6 +478,7 @@ def collect_worker_results(
     go_failures: list[tuple[str, str]] = []
     go_test_output: dict[str, list[str]] = {}
     go_pkg_output: dict[str, list[str]] = {}
+    go_other_output: list[str] = []
 
     # (elapsed_seconds, label) for every completed test in both suites
     all_timings: list[tuple[float, str]] = []
@@ -491,6 +522,8 @@ def collect_worker_results(
                 except OSError:
                     chunk = b''
                 if not chunk:
+                    if go_buffer:
+                        go_other_output.append(go_buffer.decode('utf-8', errors='replace'))
                     go_active = False
                     go_proc.finish()
                     show_progress(force=True)
@@ -503,6 +536,7 @@ def collect_worker_results(
                     try:
                         evt: dict[str, Any] = json.loads(raw)
                     except json.JSONDecodeError:
+                        go_other_output.append(raw.decode('utf-8', errors='replace') + '\n')
                         continue
                     action = evt.get('Action', '')
                     test_name = evt.get('Test', '')
@@ -625,6 +659,13 @@ def collect_worker_results(
         if go_output:
             print(go_output, end='' if go_output.endswith('\n') else '\n')
 
+    if go_proc is not None and go_proc.returncode != 0 and go_other_output:
+        print(sep1)
+        print(c(_RED + _BOLD, 'GO ERROR'))
+        print(sep2)
+        output = ''.join(go_other_output)
+        print(output, end='' if output.endswith('\n') else '\n')
+
     if py_unexpected_successes:
         print(sep1)
         print('Unexpected successes:')
@@ -674,6 +715,31 @@ def collect_worker_results(
     return True, True
 
 
+def terminate_workers(pids: list[int], procs: list['subprocess.Popen[bytes]'], go_proc: Optional[GoProc]) -> None:
+    """Kill any still running workers.
+
+    Workers run in their own sessions, so they do not get the SIGINT/SIGQUIT
+    the terminal sends to the foreground job when the user interrupts the test
+    run. Without this they would be left behind as orphans.
+    """
+    import signal
+
+    for pid in pids:
+        # waitpid() fails with ChildProcessError if pid was already reaped, which
+        # also guarantees we never signal an unrelated process that reused it
+        with suppress(ChildProcessError, OSError):
+            if os.waitpid(pid, os.WNOHANG)[0] == 0:
+                os.kill(pid, signal.SIGKILL)
+                os.waitpid(pid, 0)
+    # Popen.kill() is a no-op once the process has been reaped
+    for proc in procs:
+        proc.kill()
+        proc.wait()
+    if go_proc is not None:
+        go_proc.proc.kill()
+        go_proc.proc.wait()
+
+
 def run_tests(report_env: bool = False) -> None:
     report_env = report_env or is_ci
     import argparse
@@ -714,8 +780,11 @@ def run_tests(report_env: bool = False) -> None:
     if args.name and not tests_list and not has_go:
         raise SystemExit('No test named %s found' % ' '.join(args.name))
 
-    # Start Python workers before modifying the main-process env; each worker
-    # calls env_for_python_tests independently for full HOME/XDG isolation.
+    if report_env:
+        report_test_env()
+
+    # Start Python workers; each worker calls env_for_python_tests independently
+    # for full HOME/XDG isolation, as does the serial path below.
     # On macOS fork()+threading is unsafe, so use subprocess workers there.
     use_parallel = len(tests_list) > PARALLEL_THRESHOLD
     worker_pids: list[int] = []
@@ -741,25 +810,37 @@ def run_tests(report_env: bool = False) -> None:
     else:
         go_proc = None
     sys.stdout.flush()
-    # Module filter with no python tests but go tests present: run go only
-    if args.module and not tests_list:
-        _, go_ok = collect_worker_results([], [], [], 0, go_proc=go_proc)
-        raise SystemExit(0 if go_ok else 1)
+    try:
+        # Module filter with no python tests but go tests present: run go only
+        if args.module and not tests_list:
+            _, go_ok = collect_worker_results([], [], [], 0, go_proc=go_proc)
+            raise SystemExit(0 if go_ok else 1)
 
-    if use_parallel:
-        python_ok, go_ok = collect_worker_results(worker_pids, worker_procs, read_fds, len(tests_list), go_proc=go_proc)
-    elif tests_list:
-        python_ok = run_cli(all_tests, args.verbosity)
-        if go_proc is not None:
-            _, go_ok = collect_worker_results([], [], [], 0, go_proc=go_proc)
+        if use_parallel:
+            python_ok, go_ok = collect_worker_results(worker_pids, worker_procs, read_fds, len(tests_list), go_proc=go_proc)
+        elif tests_list:
+            # we need fonts installed in the user home directory as well, so initialize
+            # fontconfig before nuking $HOME and friends
+            from kitty.fonts.common import all_fonts_map
+
+            all_fonts_map(True)
+            # Tests must never run against the real $HOME, some of them delete
+            # files/directories in it. See run_test_worker() for the parallel equivalent.
+            with env_for_python_tests():
+                python_ok = run_cli(all_tests, args.verbosity)
+            if go_proc is not None:
+                _, go_ok = collect_worker_results([], [], [], 0, go_proc=go_proc)
+            else:
+                go_ok = True
         else:
-            go_ok = True
-    else:
-        python_ok = True
-        if go_proc is not None:
-            _, go_ok = collect_worker_results([], [], [], 0, go_proc=go_proc)
-        else:
-            go_ok = True
+            python_ok = True
+            if go_proc is not None:
+                _, go_ok = collect_worker_results([], [], [], 0, go_proc=go_proc)
+            else:
+                go_ok = True
+    except BaseException:
+        terminate_workers(worker_pids, worker_procs, go_proc)
+        raise
 
     exit_code = 0 if (python_ok and go_ok) else 1
 

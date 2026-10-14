@@ -313,6 +313,7 @@ opt(
     'text_fg_override_threshold',
     '0',
     option_type='text_fg_override_threshold',
+    ctype='text_fg_override_threshold',
     long_text="""
 A setting to prevent low contrast between foreground and background colors.
 Useful when working with applications that use colors that do not contrast
@@ -356,10 +357,11 @@ opt(
 Default text cursor color. If set to the special value :code:`none` the cursor will
 be rendered with a "reverse video" effect. Its color will be the color of the
 text in the cell it is over and the text will be rendered with the background
-color of the cell. Note that if the program running in the terminal sets a
-cursor color, this takes precedence. Also, the cursor colors are modified if
-the cell background and foreground colors have very low contrast. Note that some
-themes set this value, so if you want to override it, place your value after
+color of the cell, including its effective DIM/FAINT foreground color. Note
+that if the program running in the terminal sets a cursor color, this takes
+precedence. Also, the cursor colors are modified if the cell background and
+foreground colors have very low contrast. Note that some themes set this value, so if you want to
+override it, place your value after
 the lines where the theme file is included.
 """,
 )
@@ -458,6 +460,10 @@ for cursors that rapidly change their positions during UI updates in complex app
 See :opt:`cursor_trail_decay` to control the animation speed and :opt:`cursor_trail_start_threshold`
 to control when a cursor trail is started. You can also have different styles of trail by
 using the :opt:`custom_shaders` option, for example: :code:`custom_shaders cursor-trail-blaze`.
+To make fast cursor movements look smoother, use :code:`custom_shaders cursor-trail-motion-blur`,
+which blurs the trail slightly along the direction it is moving. For particles
+that fly off the cursor as it moves, use :code:`cursor-trail-railgun`,
+:code:`cursor-trail-torpedo` or :code:`cursor-trail-pixiedust`.
 """,
 )
 
@@ -490,7 +496,8 @@ values are specified, the first sets the x (horizontal) threshold and the
 second sets the y (vertical) threshold. The values represent the minimum
 number of cells the cursor must move in each dimension before the trail is
 started. When the cursor moves less than the threshold in both dimensions,
-the trail is skipped, reducing unnecessary cursor trail animation.
+the trail is skipped, reducing unnecessary cursor trail animation. The
+threshold does not apply when the cursor moves to a different window.
 """,
 )
 
@@ -935,7 +942,40 @@ opt(
 Detect URLs under the mouse. Detected URLs are highlighted with an underline and
 the mouse cursor becomes a hand over them. Even if this option is disabled, URLs
 are still clickable. See also the :opt:`underline_hyperlinks` option to control
-how hyperlinks (as opposed to plain text URLs) are displayed.
+how hyperlinks (as opposed to plain text URLs) are displayed. Use
+:opt:`detect_url_regex` to detect arbitrary text, such as file references, as URLs.
+""",
+)
+
+opt(
+    '+detect_url_regex',
+    '',
+    option_type='store_multiple',
+    add_to_default=False,
+    ctype='!detect_url_regex',
+    long_text="""
+A regular expression to detect as a URL under the mouse, in addition to the
+URLs detected via :opt:`url_prefixes`. Can be specified multiple times, text
+under the mouse is detected as a URL if any of the expressions match it. The
+expressions are tried in the order specified, and only if no normal URL is
+found under the mouse. Matches are highlighted and clickable exactly like
+normal detected URLs, see :opt:`detect_urls`. The expressions use the POSIX
+extended regular expression syntax, so use :code:`[0-9]` rather than
+:code:`\\\\d` and :code:`[[:alnum:]]` rather than :code:`\\\\w`. Text that has
+been soft wrapped onto multiple lines is matched as a single line, looking at
+most three lines above and below the mouse. For example, to detect file
+references of the form :file:`path/to/file.py:42`::
+
+    detect_url_regex [[:alnum:]_./-]+\\.[[:alnum:]]+:[0-9]+
+
+The matched text is used as the URL when clicked. Use :doc:`open_actions` with
+the :code:`url` criterion to specify what to do with it. Note that the
+:code:`url` criterion uses Python regular expression syntax. For example, to
+pass file references to a script of your own that opens them in an editor, add
+to :file:`open-actions.conf`::
+
+    url ^[\\w./-]+\\.\\w+:\\d+$
+    action launch --type=background open-file-ref ${URL}
 """,
 )
 
@@ -1161,7 +1201,9 @@ opt(
     long_text="""
 The threshold distance the mouse must move to start a drag and drop. Dragging
 works for tabs and windows. You can drag tabs to re-order them, detach
-them into new OS Windows or move them to another OS Window. Similarly,
+them into new OS Windows or move them to another OS Window. A tab with a single
+window can also be dropped into another tab's content area to insert that window
+at the highlighted edge, within the same kitty process. Similarly,
 by dragging the titlebar of a window (see :ac:`toggle_window_title_bars`)
 you can re-order it in its layout, detach it or move it to another tab.
 A value of zero disables all dragging.
@@ -1185,10 +1227,39 @@ Mouse buttons can be mapped to perform arbitrary actions. The syntax is:
     mouse_map button-name event-type modes action
 
 Where :code:`button-name` is one of :code:`left`, :code:`middle`, :code:`right`,
-:code:`b1` ... :code:`b8` with added keyboard modifiers. For example:
-:code:`ctrl+shift+left` refers to holding the :kbd:`Ctrl+Shift` keys while
-clicking with the left mouse button. The value :code:`b1` ... :code:`b8` can be
-used to refer to up to eight buttons on a mouse.
+:code:`b1` ... :code:`b8`, :code:`wheel_up`, :code:`wheel_down`,
+:code:`wheel_left`, :code:`wheel_right` with added keyboard modifiers. For example: :code:`ctrl+shift+left` refers to holding the
+:kbd:`Ctrl+Shift` keys while clicking with the left mouse button. The value
+:code:`b1` ... :code:`b8` can be used to refer to up to eight buttons on a
+mouse. :code:`wheel_up` and :code:`wheel_down` refer to scrolling the mouse
+wheel (or touchpad) vertically, :code:`wheel_left` and :code:`wheel_right`
+horizontally. They only support the :code:`press` event type, which is triggered
+once per wheel step. A step is one click of a classic wheel,
+one notch of a high resolution wheel or 100 pixels of touchpad travel (scaled by
+:opt:`touch_scroll_multiplier`). The direction follows the scroll direction of
+kitty, so a negative :opt:`wheel_scroll_multiplier` or
+:opt:`touch_scroll_multiplier` swaps them. Inertial (momentum) scrolling does
+not trigger them. Mapping them replaces the normal scroll behavior for that
+combination of modifiers and mode. They cannot start a selection with
+:ac:`mouse_selection`. For example, to change the font size with :kbd:`Ctrl` and
+the mouse wheel::
+
+    mouse_map ctrl+wheel_up press ungrabbed,grabbed change_font_size all +2
+    mouse_map ctrl+wheel_down press ungrabbed,grabbed change_font_size all -2
+
+Or to switch tabs by scrolling horizontally with :kbd:`Ctrl`::
+
+    mouse_map ctrl+wheel_left press ungrabbed,grabbed previous_tab
+    mouse_map ctrl+wheel_right press ungrabbed,grabbed next_tab
+
+.. note::
+    On macOS, holding :kbd:`Shift` while turning a classic mouse wheel is
+    translated by the operating system into horizontal scrolling, so such a
+    gesture triggers :code:`shift+wheel_left` and :code:`shift+wheel_right`
+    rather than :code:`shift+wheel_up` and :code:`shift+wheel_down`. Touchpads
+    are unaffected, so the same mapping can be reached by two different buttons
+    depending on the device. Prefer a modifier other than :kbd:`Shift` for
+    vertical wheel mappings that have to work with both.
 
 :code:`event-type` is one of :code:`press`, :code:`release`,
 :code:`doublepress`, :code:`triplepress`, :code:`click`, :code:`doubleclick`.
@@ -1276,10 +1347,39 @@ mma(
     'Start selecting text',
     'start_simple_selection left press ungrabbed mouse_selection normal',
     long_text="""
-If you would like to drag and drop hyperlinks or detected URLs, instead of
-:code:`normal` use :code:`drag_or_normal_select`, then if a hyperlink is under
-the mouse it will be dragged based on :opt:`drag_threshold` otherwise a normal
-selection will be performed.
+By default, pressing the left mouse button starts a new selection. To enable
+dragging selected text, hyperlinks or detected URLs, add this to :file:`kitty.conf`::
+
+    mouse_map left press ungrabbed mouse_selection drag_or_normal_select
+
+After saving, use :sc:`reload_config_file` if :opt:`auto_reload_config` is disabled.
+Select some text and release the mouse button. Then press inside the selection
+and drag it to another kitty window (including a split) or an application that
+accepts text drops. The text is copied without changing the clipboard.
+
+For programs that capture mouse events, such as editors with mouse support,
+also add the following mapping and hold :kbd:`Shift` when selecting and dragging::
+
+    mouse_map shift+left press grabbed mouse_selection drag_or_normal_select
+
+To require :kbd:`Ctrl` for dragging, use these mappings instead of the first
+example, keeping ordinary left-button selection unchanged::
+
+    mouse_map left press ungrabbed mouse_selection normal
+    mouse_map ctrl+left press ungrabbed mouse_selection drag_or_normal_select
+
+To disable text and link dragging, replace :code:`drag_or_normal_select` with
+:code:`normal` in the mappings you added. Setting :opt:`drag_threshold` to zero
+also disables dragging, but affects tab and window dragging as well.
+
+Dragging starts after the mouse has moved farther than :opt:`drag_threshold`.
+The selection takes precedence over links under the mouse. Outside a selection,
+links can be dragged as before, and other text can be selected normally. A click
+inside the selection clears it, while double and triple clicks still select
+words and lines.
+
+Drops into kitty follow the receiving window's :opt:`paste_actions` settings.
+Multiline text or text containing control codes can therefore require confirmation.
 """,
 )
 
@@ -1414,7 +1514,10 @@ Delay before input from the program running in the terminal is processed (in
 milliseconds). Note that decreasing it will increase responsiveness, but also
 increase CPU usage and might cause flicker in full screen programs that redraw
 the entire screen on each loop, because kitty is so fast that partial screen
-updates will be drawn. This setting is ignored when the input buffer is almost full.
+updates will be drawn. This setting is ignored when the input buffer is almost
+full. It is also ignored when less than 1 KB of input is pending, such as when
+the program echoes typed characters, but at most once per delay period, so
+continuous streams of small writes are still coalesced.
 """,
 )
 
@@ -1665,6 +1768,20 @@ drawn.
 )
 
 opt(
+    'window_border_radius',
+    '0',
+    option_type='window_border_width',
+    long_text="""
+The corner radius of window borders. Can be either in pixels (px) or pts (pt).
+Values in pts will be rounded to the nearest number of pixels based on screen
+resolution. If not specified, the unit is assumed to be pts. A value of zero
+disables rounded borders. This option applies only when full window borders are
+drawn; it has no effect with minimal borders. Rounded borders are drawn over
+corner cells, so use :opt:`window_padding_width` to keep text clear of them.
+""",
+)
+
+opt(
     'draw_window_borders_for_single_window',
     'no',
     option_type='to_bool',
@@ -1704,6 +1821,20 @@ bottom and left.
 )
 
 opt(
+    'collapse_window_margins',
+    'no',
+    option_type='to_bool',
+    long_text="""
+Normally, the gap between two neighboring windows is the sum of their margins,
+so it is twice as large as the gap between a window and the edge of the
+layout area. When enabled, the margins of neighboring windows collapse into
+each other, so that the gap between two windows is the same size as the gap
+at the edges, as set by :opt:`window_margin_width`. Note that when neighboring
+windows have different margins, the gap is the average of the two.
+""",
+)
+
+opt(
     'window_padding_width',
     '0',
     option_type='edge_width',
@@ -1734,8 +1865,9 @@ opt(
     choices=('top-left', 'top', 'top-right', 'left', 'center', 'right', 'bottom-left', 'bottom', 'bottom-right'),
     long_text="""
 When the window size is not an exact multiple of the cell size, the cell area of
-the terminal window will have some extra padding on the sides. You can control
-how that padding is distributed with this option. Using a value of
+the terminal window will have some extra padding on the sides. This padding is
+inside the window border, so that the borders of neighboring windows line up.
+You can control how that padding is distributed with this option. Using a value of
 :code:`center` means the cell area will be placed centrally. A value of
 :code:`top-left` means the padding will be only at the bottom and right edges.
 The value can be one of: :code:`top-left`, :code:`top`, :code:`top-right`,
@@ -2323,6 +2455,12 @@ use :code:`{sup.index}`. All data available is:
 :code:`tab.progress_percent`
     If a command running in a window reports the progress for a task, show this progress as a percentage
     from all windows in the tab, averaged. Empty string is no progress is reported.
+:code:`tab.program_status`
+    If a program running in a window reports its status using the
+    :ref:`program status protocol <program_status>`, a short symbol for the most urgent
+    status of all windows in the tab: blocked on the user, failed, finished or working
+    (with percentage, if reported), followed by the number of windows in that status,
+    if more than one. Empty string if no program reports a status.
 :code:`tab.children_mem_usage`
     The current memory usage of all child process of the tab and their descendants
 :code:`custom`
@@ -3056,7 +3194,9 @@ opt(
     long_text="""
 The maximum size (in MB) of data from programs running in kitty that will be
 stored for writing to the system clipboard. A value of zero means no size limit
-is applied. See also :opt:`clipboard_control`.
+is applied. Programs using the :doc:`clipboard protocol <clipboard>` that try to
+write more data than this are sent an ``EFBIG`` error and their data is
+discarded. See also :opt:`clipboard_control`.
 """,
 )
 
@@ -3447,7 +3587,8 @@ window. A value of :code:`menubar` will show the title of the currently active
 window in the macOS global menu bar, making use of otherwise wasted space. A
 value of :code:`all` will show the title in both places, and :code:`none` hides
 the title. See :opt:`macos_menubar_title_max_length` for how to control the
-length of the title in the menu bar.
+length of the title in the menu bar. Note that when displaying the title in the
+menubar it is prefixed by :code:`::` as a separator which cannot be changed.
 """,
 )
 

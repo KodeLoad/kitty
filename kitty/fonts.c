@@ -13,7 +13,9 @@
 #include "char-props.h"
 #include "decorations.h"
 #include "glyph-cache.h"
+#include "shaped-run-cache.h"
 #include "print-graphics.h"
+#include "simd-string.h"
 
 #define MISSING_GLYPH 1
 #define MAX_NUM_EXTRA_GLYPHS_PUA 4u
@@ -69,6 +71,7 @@ typedef struct {
     hb_feature_t *ffs_hb_features;
     size_t num_ffs_hb_features;
     GLYPH_PROPERTIES_MAP_HANDLE glyph_properties_hash_table;
+    SHAPED_RUN_MAP_HANDLE shaped_run_hash_table;
     bool bold, italic, emoji_presentation;
     SpacerStrategy spacer_strategy;
 } Font;
@@ -193,6 +196,7 @@ ensure_canvas_can_fit(FontGroup *fg, unsigned cells, unsigned scale) {
 #undef cs
     size_in_bytes = (sizeof(fg->canvas.alpha_mask[0]) * SUPERSAMPLE_FACTOR * SUPERSAMPLE_FACTOR * 2 * fg->fcm.cell_width * fg->fcm.cell_height * scale * scale);
     if (size_in_bytes > fg->canvas.alpha_mask_sz_in_bytes) {
+        free(fg->canvas.alpha_mask);
         fg->canvas.alpha_mask_sz_in_bytes = size_in_bytes;
         fg->canvas.alpha_mask = malloc(fg->canvas.alpha_mask_sz_in_bytes);
         if (!fg->canvas.alpha_mask) fatal("Out of memory allocating canvas");
@@ -235,6 +239,7 @@ void
 free_maps(Font *font) {
     free_sprite_position_hash_table(&font->sprite_position_hash_table);
     free_glyph_properties_hash_table(&font->glyph_properties_hash_table);
+    free_shaped_run_hash_table(&font->shaped_run_hash_table);
 }
 
 static void
@@ -310,10 +315,23 @@ font_group_for(double font_sz_in_pts, double logical_dpi_x, double logical_dpi_y
 
 // Sprites {{{
 
+static void sprite_tracker_set_layout(GPUSpriteTracker *sprite_tracker, unsigned int cell_width, unsigned int cell_height);
+
 void
 sprite_tracker_set_limits(size_t max_texture_size_, size_t max_array_len_) {
     max_texture_size = max_texture_size_;
     max_array_len = MIN(0xfffu, max_array_len_);
+    // Font groups are created before there is an OpenGL context, so they size
+    // their sprite layout using the conservative defaults above. Redo the
+    // layout now that the real limits are known. Only safe while no sprite has
+    // been allocated yet, since changing xnum/ynum changes what texture
+    // position an already handed out sprite index maps to.
+    for (size_t i = 0; i < num_font_groups; i++) {
+        FontGroup *fg = font_groups + i;
+        GPUSpriteTracker *st = &fg->sprite_tracker;
+        if (!st->x && !st->y && !st->z && st->ynum <= 1 && fg->fcm.cell_width && fg->fcm.cell_height)
+            sprite_tracker_set_layout(st, fg->fcm.cell_width, fg->fcm.cell_height);
+    }
 }
 
 static bool
@@ -322,7 +340,10 @@ do_increment(FontGroup *fg) {
     if (fg->sprite_tracker.x >= fg->sprite_tracker.xnum) {
         fg->sprite_tracker.x = 0;
         fg->sprite_tracker.y++;
-        fg->sprite_tracker.ynum = MIN(MAX(fg->sprite_tracker.ynum, fg->sprite_tracker.y + 1), fg->sprite_tracker.max_y);
+        if (fg->sprite_tracker.y + 1 > fg->sprite_tracker.ynum) {
+            // texture reallocation copies all sprites
+            fg->sprite_tracker.ynum = MIN(fg->sprite_tracker.max_y, MAX(fg->sprite_tracker.y + 1, fg->sprite_tracker.ynum * 2));
+        }
         if (fg->sprite_tracker.y >= fg->sprite_tracker.max_y) {
             fg->sprite_tracker.y = 0;
             fg->sprite_tracker.z++;
@@ -366,7 +387,7 @@ sprite_tracker_current_layout(FONTS_DATA_HANDLE data, unsigned int *x, unsigned 
 static void
 sprite_tracker_set_layout(GPUSpriteTracker *sprite_tracker, unsigned int cell_width, unsigned int cell_height) {
     sprite_tracker->xnum = MIN(MAX(1u, max_texture_size / cell_width), (size_t)UINT16_MAX);
-    sprite_tracker->max_y = MIN(MAX(1u, max_texture_size / cell_height), (size_t)UINT16_MAX);
+    sprite_tracker->max_y = MIN(MAX(1u, max_texture_size / (cell_height + 1)), (size_t)UINT16_MAX);
     sprite_tracker->ynum = 1;
     sprite_tracker->x = 0;
     sprite_tracker->y = 0;
@@ -518,6 +539,11 @@ init_hash_tables(Font *f) {
     }
     f->glyph_properties_hash_table = create_glyph_properties_hash_table();
     if (!f->glyph_properties_hash_table) {
+        PyErr_NoMemory();
+        return false;
+    }
+    f->shaped_run_hash_table = create_shaped_run_hash_table();
+    if (!f->shaped_run_hash_table) {
         PyErr_NoMemory();
         return false;
     }
@@ -748,11 +774,41 @@ chars_as_utf8(const ListOfChars *lc, char *buf, size_t bufsz, char_type zero_cha
     return n;
 }
 
+static bool
+is_nerd_font_codepoint(char_type ch) {
+    // The Private Use Area ranges of the glyph sets in Nerd Fonts
+    switch (ch) {
+        START_ALLOW_CASE_RANGE
+        case 0xe000 ... 0xe00a:   // Pomicons
+        case 0xe0a0 ... 0xe0d7:   // Powerline and Powerline Extra
+        case 0xe200 ... 0xe2a9:   // Font Awesome Extension
+        case 0xe300 ... 0xe3e3:   // Weather
+        case 0xe5fa ... 0xe6b7:   // Seti-UI and Custom
+        case 0xe700 ... 0xe8ef:   // Devicons
+        case 0xea60 ... 0xec1e:   // Codicons
+        case 0xed00 ... 0xf2ff:   // Font Awesome
+        case 0xf300 ... 0xf381:   // Font Logos
+        case 0xf400 ... 0xf533:   // Octicons
+        case 0xf0001 ... 0xf1af0: // Material Design
+            return true;
+            END_ALLOW_CASE_RANGE
+    }
+    return false;
+}
+
 static ssize_t
 fallback_font(FontGroup *fg, const CPUCell *cpu_cell, const GPUCell *gpu_cell, const ListOfChars *lc) {
     bool bold = gpu_cell->attrs.bold;
     bool italic = gpu_cell->attrs.italic;
     bool emoji_presentation = has_emoji_presentation(cpu_cell, lc);
+    // Nerd Font icons are private use codepoints, whose glyph depends on the
+    // font, not on the style. Looking for a bold or italic font covering one
+    // tends to find an unrelated text font that happens to cover it, for
+    // example Liberation Serif Italic for the check mark U+f00c. So ignore the
+    // style, which also renders such icons the same way in every style. Other
+    // private use codepoints are left alone, as they may be used by fonts
+    // that do have styled variants.
+    if ((bold || italic) && is_nerd_font_codepoint(lc->chars[0])) bold = italic = false;
     char style = emoji_presentation ? 'a' : 'A';
     if (bold) style += italic ? 3 : 2;
     else style += italic ? 1 : 0;
@@ -869,15 +925,12 @@ static PyObject *descriptor_for_idx = NULL;
 void
 render_alpha_mask(
     const uint8_t *alpha_mask, pixel *dest, const Region *src_rect, const Region *dest_rect, size_t src_stride, size_t dest_stride, pixel color_rgb) {
-    pixel col = (color_rgb << 8) & 0xffffff00;
+    const size_t src_width = src_rect->right > src_rect->left ? src_rect->right - src_rect->left : 0;
+    const size_t dest_width = dest_rect->right > dest_rect->left ? dest_rect->right - dest_rect->left : 0;
+    const size_t width = MIN(src_width, dest_width);
+    if (!width) return;
     for (size_t sr = src_rect->top, dr = dest_rect->top; sr < src_rect->bottom && dr < dest_rect->bottom; sr++, dr++) {
-        pixel *d = dest + dest_stride * dr;
-        const uint8_t *s = alpha_mask + src_stride * sr;
-        for (size_t sc = src_rect->left, dc = dest_rect->left; sc < src_rect->right && dc < dest_rect->right; sc++, dc++) {
-            uint8_t src_alpha = d[dc] & 0xff;
-            uint8_t alpha = s[sc];
-            d[dc] = col | MAX(alpha, src_alpha);
-        }
+        composite_alpha_mask(dest + dest_stride * dr + dest_rect->left, alpha_mask + src_stride * sr + src_rect->left, width, color_rgb);
     }
 }
 
@@ -1054,9 +1107,8 @@ render_scaled_decoration(FontCellMetrics unscaled_metrics, FontCellMetrics scale
     unsigned src_limit = MIN(scaled_metrics.cell_height, src.bottom), dest_limit = MIN(unscaled_metrics.cell_height, dest.bottom);
     unsigned cell_width = MIN(scaled_metrics.cell_width, unscaled_metrics.cell_width);
     for (unsigned srcy = src.top, desty = dest.top; srcy < src_limit && desty < dest_limit; srcy++, desty++) {
-        uint8_t *srcp = alpha_mask + cell_width * srcy;
-        pixel *destp = output + cell_width * desty;
-        for (unsigned x = 0; x < cell_width; x++) destp[x] = 0xffffff00 | srcp[x];
+        // the output was zeroed above so this sets destp[x] = 0xffffff00 | srcp[x]
+        composite_alpha_mask(output + cell_width * desty, alpha_mask + cell_width * srcy, cell_width, 0xffffff);
     }
 }
 
@@ -1422,10 +1474,7 @@ typedef struct {
     char_type current_codepoint;
 } CellData;
 
-typedef struct {
-    unsigned int first_glyph_idx, first_cell_idx, num_glyphs, num_cells;
-    bool has_special_glyph, started_with_infinite_ligature;
-} Group;
+typedef ShapeGroup Group;
 
 typedef struct {
     uint32_t previous_cluster;
@@ -1435,19 +1484,71 @@ typedef struct {
     size_t groups_capacity, group_idx, glyph_idx, cell_idx, num_cells, num_glyphs;
     CPUCell *first_cpu_cell, *last_cpu_cell;
     GPUCell *first_gpu_cell, *last_gpu_cell;
-    hb_glyph_info_t *info;
-    hb_glyph_position_t *positions;
+    hb_glyph_info_t *info, *info_storage;
+    hb_glyph_position_t *positions, *pos_storage;
+    size_t glyph_capacity;
 } GroupState;
 
 static GroupState group_state = {0};
 
+static bool
+ensure_group_glyph_storage(size_t n) {
+    if (group_state.glyph_capacity >= n) return true;
+    size_t cap = MAX(n, group_state.glyph_capacity * 2);
+    if (!cap) cap = 64;
+    hb_glyph_info_t *info = realloc(group_state.info_storage, cap * sizeof(*info));
+    if (!info) return false;
+    group_state.info_storage = info;
+    hb_glyph_position_t *pos = realloc(group_state.pos_storage, cap * sizeof(*pos));
+    if (!pos) return false;
+    group_state.pos_storage = pos;
+    group_state.glyph_capacity = cap;
+    return true;
+}
+
+static bool
+ensure_group_capacity(size_t num_cells, size_t num_groups) {
+    size_t needed = MAX(num_groups, 2 * num_cells);
+    if (group_state.groups_capacity >= needed && group_state.groups) return true;
+    size_t cap = MAX(128u, needed);
+    Group *groups = realloc(group_state.groups, sizeof(Group) * cap);
+    if (!groups) return false;
+    group_state.groups = groups;
+    group_state.groups_capacity = cap;
+    return true;
+}
+
+static bool
+restore_shaped_run(CPUCell *first_cpu_cell, GPUCell *first_gpu_cell, index_type num_cells, const ShapedRun *cached) {
+    if (!ensure_group_capacity(num_cells, cached->num_groups)) return false;
+    // every group up to group_idx is overwritten below and nothing reads past it, so zeroing the whole array is unnecessary
+    if (cached->num_groups) memcpy(group_state.groups, cached->groups, cached->num_groups * sizeof(Group));
+    else zero_at_ptr(group_state.groups);
+    if (cached->num_glyphs) {
+        if (!ensure_group_glyph_storage(cached->num_glyphs)) return false;
+        memcpy(group_state.info_storage, cached->info, cached->num_glyphs * sizeof(cached->info[0]));
+        memcpy(group_state.pos_storage, cached->positions, cached->num_glyphs * sizeof(cached->positions[0]));
+        group_state.info = group_state.info_storage;
+        group_state.positions = group_state.pos_storage;
+    } else {
+        group_state.info = NULL;
+        group_state.positions = NULL;
+    }
+    group_state.num_glyphs = cached->num_glyphs;
+    group_state.num_cells = num_cells;
+    group_state.group_idx = cached->num_groups ? cached->num_groups - 1 : 0;
+    group_state.glyph_idx = 0;
+    group_state.cell_idx = 0;
+    group_state.first_cpu_cell = first_cpu_cell;
+    group_state.first_gpu_cell = first_gpu_cell;
+    group_state.last_cpu_cell = first_cpu_cell + (num_cells ? num_cells - 1 : 0);
+    group_state.last_gpu_cell = first_gpu_cell + (num_cells ? num_cells - 1 : 0);
+    return true;
+}
+
 static void
 shape(CPUCell *first_cpu_cell, GPUCell *first_gpu_cell, index_type num_cells, hb_font_t *font, Font *fobj, bool disable_ligature, const TextCache *tc) {
-    if (group_state.groups_capacity <= 2 * num_cells) {
-        group_state.groups_capacity = MAX(128u, 2 * num_cells); // avoid unnecessary reallocs
-        group_state.groups = realloc(group_state.groups, sizeof(Group) * group_state.groups_capacity);
-        if (!group_state.groups) fatal("Out of memory");
-    }
+    if (!ensure_group_capacity(num_cells, 0)) fatal("Out of memory");
     RAII_ListOfChars(lc);
     text_in_cell(first_cpu_cell, tc, &lc);
     group_state.previous_cluster = UINT32_MAX;
@@ -1823,6 +1924,15 @@ shape_run(
     const TextCache *tc,
     ListOfChars *lc) {
     float scale = apply_scale_to_font_group(fg, &rf);
+    const uint8_t key_scale = (uint8_t)MAX(1u, rf.scale);
+    uint8_t subscale = ((rf.subscale_n & 0xf) << 4) | (rf.subscale_d & 0xf);
+    ShapedRun cached;
+    if (shaped_run_get(font->shaped_run_hash_table, first_cpu_cell, num_cells, tc, disable_ligature, OPT(force_ltr), key_scale, subscale, &cached)) {
+        if (restore_shaped_run(first_cpu_cell, first_gpu_cell, num_cells, &cached)) {
+            if (scale != 1.f) apply_scale_to_font_group(fg, NULL);
+            return scale;
+        }
+    }
     if (scale != 1.f)
         if (!face_apply_scaling(font->face, (FONTS_DATA_HANDLE)fg) && PyErr_Occurred()) PyErr_Print();
     hb_font_t *hbf = harfbuzz_font_for_face(font->face);
@@ -1836,6 +1946,7 @@ shape_run(
         hb_buffer_serialize_glyphs(harfbuzz_buffer, 0, group_state.num_glyphs, dbuf, sizeof(dbuf), NULL, harfbuzz_font_for_face(font->face), HB_BUFFER_SERIALIZE_FORMAT_TEXT, HB_BUFFER_SERIALIZE_FLAG_DEFAULT | HB_BUFFER_SERIALIZE_FLAG_GLYPH_EXTENTS);
         printf("\n%s\n", dbuf);
 #endif
+    shaped_run_put(font->shaped_run_hash_table, G(info), G(positions), (unsigned)G(num_glyphs), G(groups), (unsigned)(G(group_idx) + 1));
     if (scale != 1.f) {
         apply_scale_to_font_group(fg, NULL);
         if (!face_apply_scaling(font->face, (FONTS_DATA_HANDLE)fg) && PyErr_Occurred()) PyErr_Print();
@@ -1917,6 +2028,45 @@ render_groups(FontGroup *fg, RunFont rf, bool center_glyph, const TextCache *tc)
 }
 
 static PyObject *
+shaped_groups_as_python(void) {
+    PyObject *ans = PyList_New(0);
+    if (!ans) return NULL;
+    unsigned int idx = 0;
+    while (idx <= G(group_idx)) {
+        Group *group = G(groups) + idx;
+        if (!group->num_cells) break;
+        glyph_index first_glyph = group->num_glyphs ? G(info)[group->first_glyph_idx].codepoint : 0;
+        PyObject *eg = PyTuple_New(group->num_glyphs);
+        if (!eg) {
+            Py_DECREF(ans);
+            return NULL;
+        }
+        for (size_t g = 0; g < group->num_glyphs; g++) {
+            PyObject *gid = Py_BuildValue("H", G(info)[group->first_glyph_idx + g].codepoint);
+            if (!gid) {
+                Py_DECREF(eg);
+                Py_DECREF(ans);
+                return NULL;
+            }
+            PyTuple_SET_ITEM(eg, g, gid);
+        }
+        PyObject *item = Py_BuildValue("IIHN", group->num_cells, group->num_glyphs, first_glyph, eg);
+        if (!item) {
+            Py_DECREF(ans);
+            return NULL;
+        }
+        if (PyList_Append(ans, item) != 0) {
+            Py_DECREF(item);
+            Py_DECREF(ans);
+            return NULL;
+        }
+        Py_DECREF(item);
+        idx++;
+    }
+    return ans;
+}
+
+static PyObject *
 test_shape(PyObject UNUSED *self, PyObject *args) {
     Line *line;
     char *path = NULL;
@@ -1940,28 +2090,38 @@ test_shape(PyObject UNUSED *self, PyObject *args) {
         face = face_from_path(path, index, (FONTS_DATA_HANDLE)font_groups);
         if (face == NULL) return NULL;
         font = calloc(1, sizeof(Font));
+        if (!font) {
+            Py_CLEAR(face);
+            return PyErr_NoMemory();
+        }
         font->face = face;
-        if (!init_hash_tables(font)) return NULL;
+        if (!init_hash_tables(font)) {
+            Py_CLEAR(face);
+            free_maps(font);
+            free(font);
+            return NULL;
+        }
     } else {
         font = fg->fonts + fg->medium_font_idx;
     }
     RunFont rf = {0};
     RAII_ListOfChars(lc);
     shape_run(line->cpu_cells, line->gpu_cells, num, font, rf, fg, false, line->text_cache, &lc);
-
-    PyObject *ans = PyList_New(0);
-    unsigned int idx = 0;
-    glyph_index first_glyph;
-    while (idx <= G(group_idx)) {
-        Group *group = G(groups) + idx;
-        if (!group->num_cells) break;
-        first_glyph = group->num_glyphs ? G(info)[group->first_glyph_idx].codepoint : 0;
-
-        PyObject *eg = PyTuple_New(group->num_glyphs);
-        for (size_t g = 0; g < group->num_glyphs; g++) PyTuple_SET_ITEM(eg, g, Py_BuildValue("H", G(info)[group->first_glyph_idx + g].codepoint));
-        PyList_Append(ans, Py_BuildValue("IIHN", group->num_cells, group->num_glyphs, first_glyph, eg));
-        idx++;
+    PyObject *ans = shaped_groups_as_python();
+    if (!ans) goto done;
+    shape_run(line->cpu_cells, line->gpu_cells, num, font, rf, fg, false, line->text_cache, &lc);
+    PyObject *cached = shaped_groups_as_python();
+    if (!cached) {
+        Py_CLEAR(ans);
+        goto done;
     }
+    int same = PyObject_RichCompareBool(ans, cached, Py_EQ);
+    Py_DECREF(cached);
+    if (same != 1) {
+        Py_CLEAR(ans);
+        if (same == 0) PyErr_SetString(PyExc_RuntimeError, "shaped run cache returned a different result than HarfBuzz");
+    }
+done:
     if (face) {
         Py_CLEAR(face);
         free_maps(font);
@@ -2372,8 +2532,15 @@ finalize(void) {
         harfbuzz_buffer = NULL;
     }
     free(group_state.groups);
+    free(group_state.info_storage);
+    free(group_state.pos_storage);
     group_state.groups = NULL;
+    group_state.info_storage = NULL;
+    group_state.pos_storage = NULL;
+    group_state.info = NULL;
+    group_state.positions = NULL;
     group_state.groups_capacity = 0;
+    group_state.glyph_capacity = 0;
     free(global_glyph_render_scratch.glyphs);
     free(global_glyph_render_scratch.sprite_positions);
     if (global_glyph_render_scratch.lc) {
@@ -2408,6 +2575,15 @@ test_sprite_position_increment(PyObject UNUSED *self, PyObject *args UNUSED) {
     sprite_index_to_pos(current_sprite_index(&fg->sprite_tracker), fg->sprite_tracker.xnum, fg->sprite_tracker.ynum, &x, &y, &z);
     if (!do_increment(fg)) return NULL;
     return Py_BuildValue("III", x, y, z);
+}
+
+static PyObject *
+test_sprite_tracker_ynum(PyObject UNUSED *self, PyObject *args UNUSED) {
+    if (!num_font_groups) {
+        PyErr_SetString(PyExc_RuntimeError, "must create font group first");
+        return NULL;
+    }
+    return PyLong_FromUnsignedLong(font_groups->sprite_tracker.ynum);
 }
 
 static PyObject *
@@ -2457,8 +2633,8 @@ render_decoration(PyObject *self UNUSED, PyObject *args) {
     PyObject *ans = PyBytes_FromStringAndSize(NULL, (Py_ssize_t)fcm.cell_width * fcm.cell_height);
     if (!ans) return NULL;
     memset(PyBytes_AS_STRING(ans), 0, PyBytes_GET_SIZE(ans));
-#define u(x) \
-    if (strcmp(which, #x) == 0) add_##x##_underline((uint8_t *)PyBytes_AS_STRING(ans), fcm)
+#define u(x) else if (strcmp(which, #x) == 0) add_##x##_underline((uint8_t *)PyBytes_AS_STRING(ans), fcm)
+    if (0) {}
     u(curl);
     u(dashed);
     u(dotted);
@@ -2493,7 +2669,9 @@ concat_cells(PyObject UNUSED *self, PyObject *args) {
             void *s = ((uint8_t *)PyBytes_AS_STRING(PyTuple_GET_ITEM(cells, c)));
             if (is_32_bit) {
                 pixel *src = (pixel *)s + cell_width * r;
-                for (i = 0; i < cell_width; i++, dest++) dest[0] = alpha_blend(src[0], bgcolor);
+                for (i = 0; i < cell_width; i++) dest[i] = (pixel)bgcolor;
+                blend_over_opaque((uint8_t *)dest, 4, (const uint8_t *)src, cell_width);
+                dest += cell_width;
             } else {
                 uint8_t *src = (uint8_t *)s + cell_width * r;
                 for (i = 0; i < cell_width; i++, dest++) dest[0] = alpha_blend(0x00ffffff | ((src[i] & 0xff) << 24), bgcolor);
@@ -2587,7 +2765,7 @@ get_fallback_font(PyObject UNUSED *self, PyObject *args) {
         PyErr_SetString(PyExc_ValueError, "Too many fallback fonts");
         return NULL;
     }
-    return fg->fonts[ans].face;
+    return Py_NewRef(fg->fonts[ans].face);
 }
 
 static PyObject *
@@ -2612,7 +2790,7 @@ parse_font_feature(const char *spec) {
     ParsedFontFeature *self = (ParsedFontFeature *)ParsedFontFeature_Type.tp_alloc(&ParsedFontFeature_Type, 0);
     if (self != NULL) {
         if (!hb_feature_from_string(spec, -1, &self->feature)) {
-            PyErr_Format(PyExc_ValueError, "%s is not a valid font feature", self);
+            PyErr_Format(PyExc_ValueError, "%s is not a valid font feature", spec);
             Py_CLEAR(self);
         }
     }
@@ -2642,7 +2820,7 @@ parsed_font_feature_repr(PyObject *self_) {
 
 static PyObject *
 parsed_font_feature_cmp(PyObject *self, PyObject *other, int op) {
-    if (op != Py_EQ && op != Py_NE) return Py_NotImplemented;
+    if (op != Py_EQ && op != Py_NE) Py_RETURN_NOTIMPLEMENTED;
     if (!PyObject_TypeCheck(other, &ParsedFontFeature_Type)) {
         if (op == Py_EQ) Py_RETURN_FALSE;
         Py_RETURN_TRUE;
@@ -2731,6 +2909,7 @@ static PyMethodDef module_methods[] = {
     METHODB(create_test_font_group, METH_VARARGS),
     METHODB(sprite_map_set_layout, METH_VARARGS),
     METHODB(test_sprite_position_increment, METH_NOARGS),
+    METHODB(test_sprite_tracker_ynum, METH_NOARGS),
     METHODB(concat_cells, METH_VARARGS),
     METHODB(render_decoration, METH_VARARGS),
     METHODB(set_send_sprite_to_gpu, METH_O),

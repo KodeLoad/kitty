@@ -58,7 +58,7 @@ executable. In the script file you run remote control commands by running the
    #!/bin/sh
 
    kitten @ set-spacing margin=30
-   kitten @ new_window
+   kitten @ launch
    ...
 
 The script can perform arbitrarily complex logic and actions, limited only by
@@ -415,6 +415,8 @@ below::
     map --new-mode XXX --on-unknown end ...
     # Pass unknown keys to the program running in the active window
     map --new-mode XXX --on-unknown passthrough ...
+    # Pass unknown keys to the program and exit the keyboard mode
+    map --new-mode XXX --on-unknown passthrough_and_end ...
 
 When a key matches an action in a custom keyboard mode, the action is performed
 and the custom keyboard mode remains in effect. If you would rather have the

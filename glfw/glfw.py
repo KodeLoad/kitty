@@ -96,6 +96,7 @@ def generate_wrappers(glfw_header: str) -> None:
     void glfwCocoaSetWindowChrome(GLFWwindow* window, unsigned int color, bool use_system_color, unsigned int system_color,\
     int background_blur, unsigned int hide_window_decorations, bool show_text_in_titlebar, int color_space, float background_opacity, bool resizable)
     void glfwCocoaRegisterMIMETypes(GLFWwindow *window, const char **mimes, size_t count)
+    const char* glfwCocoaPreserveDroppedFilePromises(GLFWwindow *window)
     void glfwCocoaSetWindowLevel(GLFWwindow *window, const char *level_spec)
     const char* glfwGetPrimarySelectionString(GLFWwindow* window, void)
     int glfwGetNativeKeyForName(const char* key_name, int case_sensitive)
@@ -112,6 +113,8 @@ def generate_wrappers(glfw_header: str) -> None:
     pid_t glfwWaylandCompositorPID(void)
     double glfwGetWaylandCurrentMonitorFractionalScale(void)
     void glfwConfigureMomentumScroller(double friction, double min_velocity, double max_velocity, unsigned timer_interval)
+    void glfwFeedMomentumScroller(GLFWwindow *window, double dx, double dy, int keyboard_modifiers, bool stopped, monotonic_t timestamp)
+    void glfwCancelMomentumScroll(void)
     unsigned long long glfwDBusUserNotify(const GLFWDBUSNotificationData *n, GLFWDBusnotificationcreatedfun callback, void *data)
     void glfwDBusSetUserNotificationHandler(GLFWDBusnotificationactivatedfun handler)
     int glfwSetX11LaunchCommand(GLFWwindow *handle, char **argv, int argc)

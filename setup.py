@@ -1213,7 +1213,7 @@ def glfw_init_env(
 
     elif module == 'cocoa':
         ans.cppflags.append('-DGL_SILENCE_DEPRECATION')
-        for f_ in 'Cocoa IOKit CoreFoundation CoreVideo QuartzCore UniformTypeIdentifiers'.split():
+        for f_ in 'Cocoa IOKit CoreFoundation CoreVideo UniformTypeIdentifiers'.split():
             ans.ldpaths.extend(('-framework', f_))
 
     elif module == 'wayland':
@@ -2132,7 +2132,7 @@ def package(args: Options, bundle_type: str, do_build_all: bool = True) -> None:
     shutil.copy2('logo/beam-cursor@2x.png', os.path.join(libdir, 'logo'))
     shutil.copytree('shell-integration', os.path.join(libdir, 'shell-integration'), dirs_exist_ok=True)
     shutil.copytree('fonts', os.path.join(libdir, 'fonts'), dirs_exist_ok=True)
-    allowed_extensions = frozenset('py slang glsl so'.split())
+    allowed_extensions = frozenset('py slang pipeline glsl so'.split())
 
     def src_ignore(parent: str, entries: Iterable[str]) -> List[str]:
         return [x for x in entries if '.' in x and x.rpartition('.')[2] not in allowed_extensions]

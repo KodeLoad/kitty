@@ -108,10 +108,10 @@ base application that uses kitty's graphics protocol for images.
 A text mode WWW browser that supports kitty's graphics protocol to display
 images.
 
-.. _tool_awrit:
+.. _tool_terminal_browser:
 
-`awrit <https://github.com/chase/awrit>`__
-^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+`terminal-browser <https://terminal-browser.com/>`__
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 A full Chromium based web browser running in the terminal using kitty's
 graphics protocol.
 
@@ -412,6 +412,16 @@ the kitty remote control protocol
 
 Integrate kitty with an LLM to convert plain language prompts into shell
 commands.
+
+
+.. _tool_show_your_work:
+
+`show-your-work <https://github.com/iamumeransari/claude-show-your-work>`__
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Lets Claude Code show screenshots and play videos inline in the conversation
+using kitty's graphics protocol, including recordings of the app it built and
+before/after runs played side by side for QA.
 
 
 Miscellaneous
