@@ -551,7 +551,16 @@ parse_input_once(ChildMonitor *self, PyObject *a UNUSED) {
 static bool
 do_parse(ChildMonitor *self, Screen *screen, monotonic_t now, bool flush) {
     ParseData pd = {.dump_callback = self->dump_callback, .now = now};
+    const bool had_url_highlight = screen->url_ranges.count > 0;
+    const MouseShape pointer_shape_before = screen_pointer_shape(screen);
     self->parse_func(screen, &pd, flush);
+    // Apply pointer shape changes once per parse and only if the shape
+    // actually changed, so that a program doing a pop followed by a push of
+    // the same shape does not touch the OS pointer, which would restart
+    // animated pointers. This also handles switching to/from the alternate
+    // screen, which has its own pointer shape stack.
+    if (screen_pointer_shape(screen) != pointer_shape_before) update_pointer_shape_for_kitty_window(screen->window_id);
+    if (had_url_highlight && !screen->url_ranges.count) link_hover_cleared_by_output(screen);
     if (pd.input_read) {
         if (pd.write_space_created) wakeup_io_loop(self, false);
         if (screen->paused_rendering.expires_at) set_maximum_wait(MAX(0, screen->paused_rendering.expires_at - now));
@@ -827,7 +836,8 @@ collect_cursor_info(CursorRenderInfo *ans, Window *w, monotonic_t now, OSWindow 
     ans->multicursor_count = 0;
     ans->cursor_opacity = 1;
     ans->text_blink_opacity = 1;
-    if (!rd->screen->scrolled_by) {
+    // Use the scroll position of the rendered frame so the cursor matches the frozen text while rendering is paused
+    if (!rendered_scrolled_by(rd->screen)) {
         ans->multicursor_count = screen_multi_cursor_count(rd->screen);
         ans->is_visible = screen_is_cursor_visible(rd->screen);
     }
@@ -960,6 +970,26 @@ prepare_to_render_os_window(
                 if (global_state.ime_used && os_window->is_focused) sync_ime_position_with_cursor(os_window, w);
                 set_os_window_title_from_window(w, os_window);
                 *active_window_bg = window_bg;
+                {
+                    // Fire events for shell integration command and alternate screen changes
+                    // in the active window that happened since the last check. This is just
+                    // a few integer comparisons per frame. The check time includes the
+                    // change times seen, as input can be parsed after now was captured.
+                    const Screen *scr = WD.screen;
+                    const monotonic_t since = os_window->screen_state_checked_at;
+                    monotonic_t latest = now;
+#define CHECK(field, event)                                                         \
+    if (scr->field > since) {                                                       \
+        os_window->shader_anim_event_registry |= (1u << SHADER_ANIM_EVENT_##event); \
+        latest = MAX(latest, scr->field);                                           \
+    }
+                    CHECK(command_state.started_at, COMMAND_START);
+                    CHECK(command_state.finished_at, COMMAND_FINISH);
+                    CHECK(alternate_screen.entered_at, ALTERNATE_SCREEN_ENTER);
+                    CHECK(alternate_screen.exited_at, ALTERNATE_SCREEN_EXIT);
+#undef CHECK
+                    os_window->screen_state_checked_at = MAX(since, latest);
+                }
                 if (OPT(cursor_trail)) {
                     if (os_window->last_active_tab != os_window->active_tab && os_window->last_active_tab < os_window->num_tabs) {
                         tab->cursor_trail = os_window->tabs[os_window->last_active_tab].cursor_trail;
@@ -1007,10 +1037,6 @@ prepare_to_render_os_window(
             if (send_cell_data_to_gpu(WD.vao_idx, WD.screen, os_window)) needs_render = true;
             if (WD.screen->start_visual_bell_at | WD.screen->start_drag_overlay_at) needs_render = true;
             if (OPT(progress_bar) != PROGRESS_BAR_HIDDEN && WD.screen->progress_state == PROGRESS_STATE_INDETERMINATE) needs_render = true;
-            if (WD.screen->start_visual_bell_at && WD.screen->start_visual_bell_at > os_window->last_rendered_at) {
-                os_window->shader_anim_event_registry |= (1u << SHADER_ANIM_EVENT_BELL_IN_WINDOW);
-                os_window->last_bell_window_id = w->id;
-            }
             // Prepare window title bar screen data for GPU
             WindowRenderData *trd = &w->window_title_render_data;
             if (trd->screen && trd->geometry.bottom > trd->geometry.top && trd->geometry.right > trd->geometry.left) {
@@ -1032,7 +1058,7 @@ prepare_to_render_os_window(
         }
     }
     {
-        unsigned events = os_window->shader_anim_event_registry;
+        ShaderAnimEventMask events = os_window->shader_anim_event_registry;
         if (os_window->active_tab != os_window->last_active_tab)
             events |= (1u << SHADER_ANIM_EVENT_TAB_CHANGE) | (1u << SHADER_ANIM_EVENT_WINDOW_FOCUS_IN) | (1u << SHADER_ANIM_EVENT_WINDOW_FOCUS_OUT);
         if (*active_window_id && *active_window_id != os_window->last_active_window_id)
@@ -1209,6 +1235,7 @@ render(monotonic_t now, bool input_read) {
     const bool scan_for_animated_images = global_state.check_for_active_animated_images;
     global_state.check_for_active_animated_images = false;
     call_boss(cache_process_data, "O", Py_True);
+    bool waiting_for_frame = false;
 
     for (size_t i = 0; i < global_state.num_os_windows; i++) {
         OSWindow *w = global_state.os_windows + i;
@@ -1222,6 +1249,10 @@ render(monotonic_t now, bool input_read) {
             if (scan_for_animated_images) global_state.check_for_active_animated_images = true;
             continue;
         }
+        // A window waiting for a render frame cannot paint now, so it must not delay the
+        // paint when the frame arrives, otherwise the next output paints it mid-burst
+        if (!w->keep_rendering_till_swap && USE_RENDER_FRAMES && w->render_state != RENDER_FRAME_READY && should_os_window_be_rendered(w))
+            waiting_for_frame = true;
         if (!render_os_window(w, now, scan_for_animated_images)) {
             // since we didn't scan the window for animations, force a rescan on next wakeup/render frame
             if (scan_for_animated_images) global_state.check_for_active_animated_images = true;
@@ -1233,7 +1264,7 @@ render(monotonic_t now, bool input_read) {
             w->keep_rendering_till_swap--;
         }
     }
-    last_render_at = now;
+    if (!waiting_for_frame) last_render_at = now;
     call_boss(cache_process_data, "O", Py_False);
 #undef TD
 }

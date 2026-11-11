@@ -12,17 +12,20 @@ from collections.abc import Callable, Generator, Iterable, Iterator, Sequence
 from contextlib import suppress
 from functools import wraps
 from gettext import gettext as _
-from typing import Any, Concatenate, Deque, Literal, NamedTuple, Optional, ParamSpec, TypeVar, cast
+from typing import TYPE_CHECKING, Any, Concatenate, Deque, Literal, NamedTuple, Optional, ParamSpec, TypeVar, cast
 
 from .borders import Border, Borders
 from .child import Child
 from .cli_stub import CLIOptions, SaveAsSessionOptions
-from .constants import appname
+from .constants import appname, is_wayland
 from .fast_data_types import (
     GLFW_MOUSE_BUTTON_LEFT,
     GLFW_MOUSE_BUTTON_MIDDLE,
     GLFW_PRESS,
     GLFW_RELEASE,
+    WINDOW_FULLSCREEN,
+    WINDOW_MAXIMIZED,
+    WINDOW_MINIMIZED,
     add_tab,
     add_timer,
     attach_window,
@@ -33,6 +36,7 @@ from .fast_data_types import (
     get_boss,
     get_click_interval,
     get_options,
+    get_os_window_geometry,
     get_tab_being_dragged,
     get_window_being_dragged,
     is_tab_bar_visible,
@@ -64,6 +68,9 @@ from .typing_compat import EdgeLiteral, SessionTab, SessionType, TypedDict
 from .utils import cmdline_for_hold, color_as_int, log_error, natsort_key, platform_window_id, resolved_shell, shlex_split, which
 from .window import CwdRequest, Watchers, Window, WindowCreationSpec, WindowDict, global_watchers
 from .window_list import WindowGroup, WindowList
+
+if TYPE_CHECKING:
+    from .fast_data_types import OSWindowGeometry
 
 P = ParamSpec('P')
 T = TypeVar('T')
@@ -172,6 +179,29 @@ def SpecialWindow(
     hold: bool = False,
 ) -> SpecialWindowInstance:
     return SpecialWindowInstance(cmd, stdin, override_title, cwd_from, cwd, overlay_for, env, watchers, overlay_behind, hold)
+
+
+def os_window_geometry_as_session(g: 'OSWindowGeometry', include_position: bool = True) -> list[str]:
+    ans = [f'os_window_size {g["width"]} {g["height"]}']
+    if include_position:
+        ans.append(f'os_window_position {g["x"]}x{g["y"]}')
+    state = {WINDOW_FULLSCREEN: 'fullscreen', WINDOW_MAXIMIZED: 'maximized', WINDOW_MINIMIZED: 'minimized'}.get(g['state'], 'normal')
+    ans.append(f'os_window_state {state}')
+    return ans
+
+
+def index_of_tab_to_focus_in_session(active_tab_idx: int, last_focused_at: Sequence[float]) -> int:
+    """
+    The focus_tab index for a saved session, which counts only the tabs the session
+    creates. active_tab_idx is the index of the active tab among the saved tabs, or
+    -1 if it was not saved, in which case the saved tab with the most recently
+    focused saved window is used. With --match=session:NAME that is the tab
+    goto_session switches to while the session is open. last_focused_at has one
+    entry per saved tab.
+    """
+    if 0 <= active_tab_idx < len(last_focused_at):
+        return active_tab_idx
+    return max(range(len(last_focused_at)), key=last_focused_at.__getitem__, default=0)
 
 
 def add_active_id_to_history(items: Deque[int], item_id: int, maxlen: int = 64) -> None:
@@ -374,7 +404,9 @@ class Tab:  # {{{
                     target_tab=target_tab,
                     force_target_tab=True,
                     startup_command_via_shell_integration=window.run_command_at_shell_startup,
+                    restored_scrollback=window.restored_scrollback,
                 )
+                window.restored_scrollback = b''  # free the memory, it is no longer needed
                 if launched_window is not None:
                     launched_window.serialized_id = window.serialized_id
             if launched_window is not None:
@@ -439,7 +471,14 @@ class Tab:  # {{{
             'name': self.name,
         }
 
-    def serialize_state_as_session(self, session_path: str, matched_windows: frozenset[Window] | None, ser_opts: SaveAsSessionOptions) -> list[str]:
+    def serialize_state_as_session(
+        self,
+        session_path: str,
+        matched_windows: frozenset[Window] | None,
+        ser_opts: SaveAsSessionOptions,
+        saved_windows: list[Window] | None = None,
+    ) -> list[str]:
+        """If saved_windows is not None, the windows written to the session are appended to it"""
         import shlex
 
         launch_cmds = []
@@ -486,6 +525,8 @@ class Tab:  # {{{
                 )
                 if lc:
                     gw.append(shlex.join(lc))
+                    if saved_windows is not None:
+                        saved_windows.append(window)
             if gw:
                 emitted_group_ids.add(g.id)
                 launch_cmds.extend(gw)
@@ -906,6 +947,7 @@ class Tab:  # {{{
         startup_command_via_shell_integration: Sequence[str] | str = (),
         dock: DockSpec | None = None,
         dock_owner: WindowGroup | None = None,
+        restored_scrollback: bytes = b'',
     ) -> Window:
         "Create a new window. When dock is specified, the window is docked to dock_owner or to the tab if dock_owner is None."
         cs = WindowCreationSpec(
@@ -954,6 +996,7 @@ class Tab:  # {{{
             remote_control_passwords=remote_control_passwords,
         )
         window.creation_spec = cs
+        window.restored_scrollback = restored_scrollback
         # Must add child before laying out so that resize_pty succeeds
         get_boss().add_child(window)
         self._add_window(
@@ -1751,24 +1794,32 @@ class TabManager:  # {{{
     def serialize_state_as_session(
         self, session_path: str, matched_windows: frozenset[Window] | None, ser_opts: SaveAsSessionOptions, is_first: bool = False
     ) -> list[str]:
-        ans = []
-        active_tab_index = -1
-        for i, tab in enumerate(self.tabs):
-            if tab is self.active_tab:
-                active_tab_index = i
-            ans.extend(tab.serialize_state_as_session(session_path, matched_windows, ser_opts))
+        ans: list[str] = []
+        active_tab_idx = -1
+        last_focused_at: list[float] = []
+        for tab in self.tabs:
+            saved_windows: list[Window] = []
+            if lines := tab.serialize_state_as_session(session_path, matched_windows, ser_opts, saved_windows):
+                if tab is self.active_tab:
+                    active_tab_idx = len(last_focused_at)
+                last_focused_at.append(max((w.last_focused_at for w in saved_windows), default=0))
+                ans.extend(lines)
         if ans:
             prefix = [] if is_first else ['', '', 'new_os_window']
             if self.wm_class and self.wm_class != appname:
                 prefix.append(f'os_window_class {self.wm_class}')
             if self.wm_name and self.wm_name != appname:
                 prefix.append(f'os_window_name {self.wm_name}')
+            if ser_opts.os_window_geometry:
+                prefix.extend(self.serialize_geometry_as_session())
             ans = prefix + ans
-            # Add focus_tab command to preserve the active tab
-            if active_tab_index >= 0:
-                ans.append('')
-                ans.append(f'focus_tab {active_tab_index}')
+            ans.append('')
+            ans.append(f'focus_tab {index_of_tab_to_focus_in_session(active_tab_idx, last_focused_at)}')
         return ans
+
+    def serialize_geometry_as_session(self) -> list[str]:
+        g = get_os_window_geometry(self.os_window_id)
+        return [] if g is None else os_window_geometry_as_session(g, include_position=not is_wayland())
 
     @property
     def active_tab(self) -> Tab | None:
@@ -2124,6 +2175,7 @@ class TabManager:  # {{{
         if (w := boss.window_id_map.get(window_id)) is None:
             set_window_being_dragged()
             return
+        boss.awaiting_window_drop = False
         opts = get_options()
         min_w = opts.window_title_bar_min_windows
         for tm in boss.all_tab_managers:
@@ -2380,6 +2432,14 @@ class TabManager:  # {{{
         central, tab_bar = viewport_for_window(self.os_window_id)[:2]
         in_tab_bar = tab_bar.left <= x < tab_bar.right and tab_bar.top <= y < tab_bar.bottom
         tab_target = self.tab_bar.window_drop_target_at(x, y) if in_tab_bar else None
+        in_central = central.left <= x < central.right and central.top <= y < central.bottom
+        # Classify the drop before hiding the title bars shown only for the drag, as
+        # hiding them changes the window geometry the preview was drawn against.
+        dest_window = self._find_window_at(x, y) if tab_target is None and in_central else None
+        if dest_window is not None and dest_window.id == window_id:
+            dest_window = None
+        on_title_bar = dest_window is not None and self._pointer_in_title_bar_of(dest_window, y)
+        direction = self._drop_direction_for(dest_window, x, y) if dest_window is not None and not on_title_bar else None
         self._clear_force_show_title_bars()
         w = boss.window_id_map.get(window_id)
         if w is None:
@@ -2395,21 +2455,19 @@ class TabManager:  # {{{
             return
 
         # Case 2: Drop in central area
-        in_central = central.left <= x < central.right and central.top <= y < central.bottom
         if not in_central:
             return
 
         if (active_tab := self.active_tab) is None:
             return
 
-        dest_window = self._find_window_at(x, y)
-        if dest_window is None or dest_window.id == window_id:
+        if dest_window is None:
             # Dropped on empty space or self; if different tab, move there
             if active_tab is not w.tabref():
                 boss._move_window_to(w, target_tab_id=active_tab.id)
             return
 
-        if self._pointer_in_title_bar_of(dest_window, y):
+        if direction is None:
             if (src_tab := w.tabref()) is dest_window.tabref() and src_tab is not None:
                 # Same tab: swap positions
                 src_tab.swap_windows(w, dest_window)
@@ -2417,7 +2475,7 @@ class TabManager:  # {{{
                 # Cross-tab title bar drop: move to the destination tab
                 boss._move_window_to(w, target_tab_id=active_tab.id)
         else:
-            boss._insert_window_in_direction(w, dest_window, self._drop_direction_for(dest_window, x, y))
+            boss._insert_window_in_direction(w, dest_window, direction)
 
     def update_progress(self) -> None:
         self.num_of_windows_with_progress = 0

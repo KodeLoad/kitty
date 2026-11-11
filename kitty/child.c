@@ -107,10 +107,35 @@ spawn(PyObject *self UNUSED, PyObject *args) {
             &pass_fds))
         return NULL;
     char name[2048] = {0};
-    if (ttyname_r(slave, name, sizeof(name) - 1) != 0) {
+#ifdef __APPLE__
+    // ttyname_r() on macOS calls lstat() on every entry in /dev until it finds
+    // the pty, so a single stuck entry can hang it. ptsname_r() gets the name
+    // from the master with an ioctl() instead.
+    // See https://github.com/kovidgoyal/kitty/issues/10741
+    int ret = ptsname_r(master, name, sizeof(name) - 1);
+#else
+    int ret = ttyname_r(slave, name, sizeof(name) - 1);
+#endif
+    if (ret != 0) {
         PyErr_SetFromErrno(PyExc_OSError);
         return NULL;
     }
+#ifdef __APPLE__
+    // The name came from master, ensure it refers to the same pty as slave
+    struct stat slave_st, name_st;
+    if (fstat(slave, &slave_st) != 0) {
+        PyErr_SetFromErrno(PyExc_OSError);
+        return NULL;
+    }
+    if (stat(name, &name_st) != 0) {
+        PyErr_SetFromErrnoWithFilename(PyExc_OSError, name);
+        return NULL;
+    }
+    if (slave_st.st_rdev != name_st.st_rdev) {
+        PyErr_Format(PyExc_ValueError, "The slave fd %d is not the pty of the master fd %d (%s)", slave, master, name);
+        return NULL;
+    }
+#endif
     char **argv = serialize_string_tuple(argv_p, 0);
     if (!argv) return NULL;
     char **env = serialize_string_tuple(env_p, 1);
@@ -121,16 +146,12 @@ spawn(PyObject *self UNUSED, PyObject *args) {
     int handled_signals[16] = {0}, num_handled_signals = MIN((int)arraysz(handled_signals), PyTuple_GET_SIZE(handled_signals_p));
     for (Py_ssize_t i = 0; i < num_handled_signals; i++) handled_signals[i] = PyLong_AsLong(PyTuple_GET_ITEM(handled_signals_p, i));
 
-#if PY_VERSION_HEX >= 0x03070000
     PyOS_BeforeFork();
-#endif
     pid_t pid = fork();
     switch (pid) {
         case 0: {
             // child
-#if PY_VERSION_HEX >= 0x03070000
             PyOS_AfterFork_Child();
-#endif
             const struct sigaction act = {.sa_handler = SIG_DFL};
 
 #define SA(which) \
@@ -231,19 +252,13 @@ spawn(PyObject *self UNUSED, PyObject *args) {
             break;
         }
         case -1: {
-#if PY_VERSION_HEX >= 0x03070000
             int saved_errno = errno;
             PyOS_AfterFork_Parent();
             errno = saved_errno;
-#endif
             PyErr_SetFromErrno(PyExc_OSError);
             break;
         }
-        default:
-#if PY_VERSION_HEX >= 0x03070000
-            PyOS_AfterFork_Parent();
-#endif
-            break;
+        default: PyOS_AfterFork_Parent(); break;
     }
 #undef exit_on_err
     free(argv);

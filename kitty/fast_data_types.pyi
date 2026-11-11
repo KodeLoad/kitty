@@ -1,5 +1,5 @@
 import termios
-from typing import Any, Callable, Dict, Iterator, List, Literal, NewType, Optional, Sequence, Tuple, TypedDict, Union, overload
+from typing import Any, Callable, Dict, Iterator, List, Literal, Mapping, NewType, Optional, Sequence, Tuple, TypedDict, Union, overload
 
 from kitty.borders import Border
 from kitty.boss import Boss
@@ -15,6 +15,14 @@ from kitty.typing_compat import EdgeLiteral, NotRequired, ReadableBuffer, Writea
 # Constants {{{
 SCALE_BITS: int
 NULL_COLOR_VALUE: int
+# Which layer of colors patch_color_profiles() changes: the colors set by the
+# program running in the window, the global configured colors, the configured
+# colors of individual windows or the color scheme of the session running in
+# the window, such as from the ssh kitten
+COLOR_LAYER_OVERRIDE: int
+COLOR_LAYER_GLOBAL: int
+COLOR_LAYER_WINDOW: int
+COLOR_LAYER_SESSION: int
 DEVELOP_ROOT: str
 WIDTH_BITS: int
 SUBSCALE_BITS: int
@@ -49,6 +57,8 @@ CLD_CONTINUED: int
 CLD_EXITED: int
 SHM_NAME_MAX: int
 MAX_CUSTOM_SHADER_GROUPS: int
+MAX_SHADER_ANIM_USER_EVENTS: int
+MAX_SHADER_ANIM_USER_EVENT_NAME_LEN: int
 POINTER_MAP_SIZE: int
 MOUSE_SELECTION_LINE: int
 MOUSE_SELECTION_EXTEND: int
@@ -66,6 +76,7 @@ MOUSE_WHEEL_DOWN: int
 MOUSE_WHEEL_LEFT: int
 MOUSE_WHEEL_RIGHT: int
 KITTY_VCS_REV: str
+KITTY_VERSION_SUFFIX: str
 NO_CLOSE_REQUESTED: int
 IMPERATIVE_CLOSE_REQUESTED: int
 CLOSE_BEING_CONFIRMED: int
@@ -304,8 +315,11 @@ DIM: int
 GRAPHICS_ALPHA_MASK_PROGRAM: int
 GRAPHICS_PROGRAM: int
 GRAPHICS_PREMULT_PROGRAM: int
+GRAPHICS_INDEXED_PROGRAM: int
+GRAPHICS_INDEXED_UNSCALED_PROGRAM: int
 MARK: int
 MARK_MASK: int
+NUM_INDEXED_IMAGE_SPECIAL_COLORS: int
 DECORATION_MASK: int
 FILE_TRANSFER_CODE: int
 ESC_CSI: int
@@ -546,6 +560,15 @@ def custom_shader_needs_render(before: Tuple[bool, int, int], after: Tuple[bool,
 def decorations_map_new_size(count: int, current_capacity: int, max_size: int) -> Optional[Tuple[int, int]]: ...
 def simulate_custom_shader_render_ticks(num_ticks: int, event_mask: int = 0, initialize: bool = False) -> list[bool]: ...
 def sample_pointer_map(data: bytes, u: float, v: float) -> tuple[float, float]: ...
+def fire_custom_shader_event(name: str, os_window_id: int = 0) -> bool: ...
+@overload
+def simulate_custom_shader_animation(
+    pipeline: Mapping[str, object], ticks: list[Sequence[str]], with_progress: Literal[False] = False
+) -> list[tuple[bool, ...]]: ...
+@overload
+def simulate_custom_shader_animation(
+    pipeline: Mapping[str, object], ticks: list[Sequence[str]], with_progress: Literal[True]
+) -> list[tuple[float | None, ...]]: ...
 def set_os_window_chrome(os_window_id: int) -> bool:
     pass
 
@@ -565,10 +588,12 @@ def dbus_send_notification(
     replaces: int = 0,
     category: str = '',
     muted: bool = False,
+    desktop_entry: str = '',
 ) -> int:
     pass
 
 def dbus_close_notification(dbus_notification_id: int) -> bool: ...
+def dbus_monitor_session_state(callback: Callable[[int], None]) -> bool: ...
 def cocoa_send_notification(
     appname: str,
     identifier: str,
@@ -796,9 +821,16 @@ class ColorProfile:
     def palette_color_is_generated(self, idx: int) -> None: ...
     def get_transparent_background_color(self, index: int) -> Color | None: ...
     def set_transparent_background_color(self, index: int, color: Color | None = None, opacity: float | None = None) -> None: ...
+    def reset_layer(self, layer: int) -> None: ...
+    def color_stack_depth(self) -> int: ...
+    def test_mark_colors(self) -> tuple[tuple[int, int], ...]: ...
 
 def patch_color_profiles(
-    spec: Dict[str, Optional[int]], transparent_background_colors: tuple[tuple[Color, float], ...], profiles: Tuple[ColorProfile, ...], change_configured: bool
+    spec: Dict[str, Optional[int]],
+    transparent_background_colors: Optional[tuple[tuple[Color, float], ...]],
+    profiles: Tuple[ColorProfile, ...],
+    layer: int,
+    clear_upper_layers: bool = False,
 ) -> None:
     pass
 
@@ -848,6 +880,9 @@ def set_application_quit_request(cr_type: int = 2) -> None:
 def current_application_quit_request() -> int:
     pass
 
+def application_logout_requested_at() -> float:
+    pass
+
 def global_font_size(val: float = -1.0) -> float:
     pass
 
@@ -878,10 +913,32 @@ def last_focused_os_window_id() -> int:
 def current_focused_os_window_id() -> int:
     pass
 
+def cocoa_keychain_store_secret(service: str, account: str, label: str, secret: Secret) -> None:
+    pass
+
+def cocoa_keychain_read_secret(service: str, account: str) -> Optional[Secret]:
+    pass
+
+def cocoa_keychain_delete(service: str, account: str) -> bool:
+    pass
+
+def cocoa_keychain_list_accounts(service: str) -> List[str]:
+    pass
+
 def cocoa_set_menubar_title(title: str) -> None:
     pass
 
 def change_os_window_state(state: int, os_window_id: Optional[int] = 0) -> None:
+    pass
+
+class OSWindowGeometry(TypedDict):
+    x: int
+    y: int
+    width: int
+    height: int
+    state: int
+
+def get_os_window_geometry(os_window_id: int) -> Optional[OSWindowGeometry]:
     pass
 
 def change_background_opacity(os_window_id: int, opacity: float) -> bool:
@@ -1066,6 +1123,22 @@ class Cursor:
     text_blink: bool
     shape: int
 
+class ImageLayerRect(TypedDict):
+    left: float
+    top: float
+    right: float
+    bottom: float
+
+class ImageLayer(TypedDict):
+    src_rect: ImageLayerRect
+    dest_rect: ImageLayerRect
+    group_count: int
+    z_index: int
+    image_id: int
+    ref_id: int
+    indexed_px_sz: int
+    is_unscaled: bool
+
 class Screen:
     color_profile: ColorProfile
     columns: int
@@ -1080,6 +1153,11 @@ class Screen:
     cursor_visible: bool
     scrolled_by: int
     pixel_scroll_offset_y: int
+    command_running: bool
+    command_started_at: int
+    command_finished_at: int
+    alternate_screen_entered_at: int
+    alternate_screen_exited_at: int
     cursor: Cursor
     disable_ligatures: int
     cursor_key_mode: bool
@@ -1104,10 +1182,15 @@ class Screen:
     def test_create_write_buffer(self) -> memoryview: ...
     def test_commit_write_buffer(self, inp: memoryview, output: memoryview) -> int: ...
     def test_parse_written_data(self, dump_callback: None = None) -> None: ...
+    def test_draw_overlay_line(self, text: str, xstart: int, ynum: int, preedit_cursor: int = -1) -> int: ...
+    def test_update_overlay_text(self, text: str, preedit_cursor: int = -1) -> int: ...
     def hyperlink_for_id(self, hyperlink_id: int) -> str: ...
     def erase_last_command(self) -> bool: ...
     def set_progress(self, state: int, percent: int) -> None: ...
     def cursor_at_prompt(self) -> bool:
+        pass
+
+    def cursor_prompt_line(self) -> int:
         pass
 
     def ignore_bells_for(self, duration: float = 1) -> None:
@@ -1126,6 +1209,9 @@ class Screen:
         pass
 
     def draw(self, text: str) -> None:
+        pass
+
+    def restore_scrollback(self, data: bytes) -> None:
         pass
 
     def dump_lines_with_attrs(self, acc: Callable[[str], None], which_screen: int = -1) -> None:
@@ -1257,6 +1343,10 @@ class Screen:
     def change_pointer_shape(self, op: str, name: str) -> None: ...
     def bell(self) -> None: ...
     def pause_rendering(self, pause: bool = True, for_how_long_in_ms: int = 100) -> bool: ...
+    def rendered_scroll_state(self) -> Tuple[int, int, int]: ...
+    def scrollbar_geometry(self) -> Tuple[float, float]: ...
+    def has_scrollbar(self, is_hovering: bool) -> bool: ...
+    def update_graphics_layers(self) -> Tuple[ImageLayer, ...]: ...
 
 def set_tab_bar_render_data(os_window_id: int, screen: Screen, left: int, top: int, right: int, bottom: int) -> None:
     pass
@@ -1467,7 +1557,7 @@ def send_data_to_peer(peer_id: int, data: Union[str, bytes], is_async_response: 
 def set_os_window_title(os_window_id: int, title: str) -> None:
     pass
 
-def get_os_window_title(os_window_id: int) -> Optional[str]:
+def get_os_window_title(os_window_id: int, only_if_overridden: bool = False) -> Optional[str]:
     pass
 
 def update_ime_position_for_window(window_id: int, force: bool = False, update_focus: int = 0) -> bool:
@@ -1499,6 +1589,9 @@ SHA384_HASH: int
 SHA512_HASH: int
 
 class Secret:
+    pass
+
+def random_secret(length: int = 32) -> Secret:
     pass
 
 class EllipticCurveKey:
@@ -1582,7 +1675,6 @@ def base64_decode_into(src: Union[str, ReadableBuffer], output: WriteableBuffer)
 def cocoa_recreate_global_menu() -> None: ...
 def cocoa_clear_global_shortcuts() -> None: ...
 def cocoa_get_machine_id() -> str: ...
-def update_pointer_shape(os_window_id: int) -> None: ...
 def is_layer_shell_supported() -> bool: ...
 def os_window_focus_counters() -> Dict[int, int]: ...
 def find_in_memoryview(buf: Union[bytes, memoryview, bytearray], chr: int) -> int: ...

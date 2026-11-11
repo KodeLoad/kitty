@@ -38,6 +38,28 @@ class TestConfParsing(BaseTest):
     def test_font_size_clamping(self):
         font_size_clamping(self)
 
+    def test_patch_global_special_colors(self):
+        from kitty.fast_data_types import patch_global_colors
+
+        self.set_options()
+        try:
+            for name, value in (
+                ('wayland_titlebar_color', 0x80000002),
+                ('scrollbar_handle_color', 0xFF000002),
+                ('scrollbar_track_color', 0xFFFFFF02),
+                ('macos_titlebar_color', -1),
+                ('macos_titlebar_color', -2),
+            ):
+                with self.subTest(name=name, value=value):
+                    patch_global_colors({name: value}, False)
+            # These options are decoded as unsigned, so negative values must be
+            # rejected on all platforms, not silently stored.
+            for name in ('wayland_titlebar_color', 'scrollbar_handle_color', 'scrollbar_track_color'):
+                with self.subTest(name=name, value=-1), self.assertRaises(OverflowError):
+                    patch_global_colors({name: -1}, False)
+        finally:
+            self.set_options()
+
     def test_session_launch_option_expansion(self) -> None:
         from kitty.launch import LaunchSpec
         from kitty.options.types import defaults
@@ -126,6 +148,15 @@ class TestConfParsing(BaseTest):
                 actual = window.screen.color_profile.as_dict()
                 self.ae(actual.get('transparent_background_colors', ()), expected)
                 self.ae(actual['foreground'], 0xFF0000)
+
+        # colors that do not mention transparent_background_colors must leave existing ones unchanged
+        window = Window.__new__(Window)
+        window.screen = self.create_screen()
+        apply_colors(window, ('transparent_background_colors=#ffffff@0.5',))
+        apply_colors(window, ('foreground=red',))
+        self.ae(window.screen.color_profile.as_dict().get('transparent_background_colors', ()), ((Color(255, 255, 255), 0.5),))
+        apply_colors(window, ('transparent_background_colors=',))
+        self.ae(window.screen.color_profile.as_dict().get('transparent_background_colors', ()), ())
 
 
 def cli_parsing(self):
@@ -375,6 +406,10 @@ def conf_parsing(self):
     self.ae(opts.font_size, 11.37)
     radius_opts = p('window_border_radius 7px')
     self.ae(radius_opts.window_border_radius, (7.0, 'px'))
+    self.ae(defaults.hyperlink_target_position, 'top')
+    for pos in ('top', 'bottom', 'below', 'tooltip'):
+        self.ae(p(f'hyperlink_target_position {pos}').hyperlink_target_position, pos)
+    self.ae(p('hyperlink_target_position xxx', bad_line_num=1).hyperlink_target_position, 'top')
     radius_opts = p('window_border_radius -2')
     self.ae(radius_opts.window_border_radius, (0.0, 'pt'))
     self.ae(opts.mouse_hide_wait[0], 0 if is_macos else 3)

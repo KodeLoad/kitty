@@ -537,6 +537,40 @@ class TestGraphics(BaseTest):
         self.ae(pl('abcd', s=1, v=1, a='q'), 'OK')
         self.ae(g.image_count, 0)
 
+        # Test feature queries
+        def q(e, payload='', **kw):
+            res = send_command(s, ','.join(f'{k}={v}' for k, v in dict(a='q', i=31, e=e, **kw).items()), payload)
+            return res.decode('ascii') if res else None
+
+        def r(keys=''):
+            return f'\033_Gi=31{keys};OK\033\\'
+
+        self.ae(q('T', s=1, v=1, f=24, U=1), r(',e=T,f=24,s=1,v=1,U=1'))
+        self.ae(q('T', s=1, v=1, f=24, t='d', C=1, z=-3, N=1), r(',e=T,t=d,f=24,s=1,v=1,N=1,C=1,z=-3'))
+        # no image data is needed or loaded
+        self.ae(q('t', 'abcd', s=1, v=1, f=8, c=2), r(',e=t,f=8,s=1,v=1'))
+        self.ae(g.image_count, 0)
+        # keys are interpreted according to the action being queried
+        self.ae(q('p', c=2, r=3, U=1, C=1, s=1), r(',e=p,c=2,r=3,C=1,U=1'))
+        self.ae(q('f', c=2, r=3, z=40, X=1, f=8, s=1), r(',e=f,s=1,c=2,r=3,z=40,X=1'))
+        self.ae(q('a', s=3, v=1, r=2, c=1, z=-1), r(',e=a,s=3,v=1,r=2,c=1,z=-1'))
+        self.ae(q('c', r=1, c=2, w=3, X=1, C=1, U=1), r(',e=c,r=1,c=2,w=3,X=1,C=1'))
+        self.ae(q('d', d='F', p=2, s=1), r(',e=d,d=F,p=2'))
+        # unsupported values are not reported
+        self.ae(q('T', s=1, v=1, f=24, C=7, N=6, U=2), r(',e=T,f=24,s=1,v=1'))
+        self.ae(q('t', f=42, s=100000), r(',e=t'))
+        self.ae(q('a', s=4), r(',e=a'))
+        # unknown actions are not reported
+        self.ae(q('x', s=1, v=1, f=24, U=1), r())
+        # a feature query does not disturb a chunked load in progress
+        self.assertIsNone(pl('ab', i=99, s=1, v=1, f=24, m=1))
+        self.ae(q('T', U=1), r(',e=T,U=1'))
+        self.ae(pl('c', i=99, m=0), 'OK')
+        self.ae(g.image_count, 1)
+        s.reset()
+        self.ae(g.image_count, 0)
+        self.assertIsNone(q('T', U=1, q=1))
+
         # Test simple load
         for f in 32, 24:
             p = 'abc' + ('d' if f == 32 else '')
@@ -669,7 +703,14 @@ class TestGraphics(BaseTest):
         # A shared memory object that could not be opened must also be
         # removed, and reported with the same generic error
         self.ae(pl('/kitty-test-shm-missing', s=1024, v=8, t='s'), generic_error)
-        self.ae(pl('kitty-test-shm-no-leading-slash', s=1024, v=8, t='s'), generic_error)
+        self.ae(pl('kitty-test-shm-missing-no-leading-slash', s=1024, v=8, t='s'), generic_error)
+
+        # Names without a leading slash must be accepted, as, for example,
+        # sandboxed applications on macOS cannot use a leading slash
+        name = 'kitty-test-shm-no-leading-slash'
+        shm_write(name, random_data)
+        sl(name, s=1024, v=8, t='s', expecting_data=random_data)
+        self.assertRaises(FileNotFoundError, shm_unlink, name)  # check that the object was deleted
 
         s.reset()
         self.assertEqual(g.disk_cache.total_size, 0)
@@ -936,6 +977,60 @@ class TestGraphics(BaseTest):
         self.ae(group_counts(), (4, 3, 2, 1))
         self.ae(put_image(s, 8, 16, id=2, z=-1)[1], 'OK')
         self.ae(group_counts(), (2, 1, 1, 2, 1))
+
+    def test_indexed_color_images(self):
+        s, g, pl, sl = load_helpers(self)
+        li = make_send_command(s)
+
+        # Loading
+        self.ae(pl('ab', s=1, v=1, f=8, a='q'), 'OK')
+        self.ae(g.image_count, 0)
+        img = sl(bytes(range(8)), s=4, v=2, f=8)
+        self.ae(img['indexed_px_sz'], 1)
+        img = sl(bytes(range(8)), s=2, v=2, f=16)
+        self.ae(img['indexed_px_sz'], 2)
+        data = bytes(range(256)) * 4
+        img = sl(zlib.compress(data), s=32, v=16, f=16, o='z', expecting_data=data)
+        self.ae(img['indexed_px_sz'], 2)
+        self.ae(pl(bytes(range(3)), s=3, v=1, f=8), 'OK')
+        img = g.image_for_client_id(1)
+        self.ae((img['indexed_px_sz'], img['is_4byte_aligned'], img['data']), (1, False, bytes(range(3))))
+        self.assertTrue(pl(bytes(range(5)), s=3, v=1, f=16).startswith('ENODATA'))
+        self.assertTrue(pl(b'', s=0, v=1, f=8).startswith('EINVAL'))
+
+        # Replacing an indexed image with a normal one
+        img = sl(b'abcd', s=1, v=1, f=32)
+        self.ae(img['indexed_px_sz'], 0)
+
+        # Animation is not supported
+        def unsupported(r, what='Animation'):
+            self.ae((r.code, r.msg), ('EINVAL', f'{what} is not supported for indexed color images'))
+
+        self.ae(li(b'abcd', s=2, v=2, f=8, a='t').code, 'OK')
+        unsupported(li(b'abcd', s=2, v=2, f=8, a='f'))
+        unsupported(li(b'abcd', s=1, v=1, f=32, a='f'))
+        unsupported(li(b'', a='c', r=1, c=1, w=1, h=1, x=1, s=0, v=0, f=0), 'Composition')
+        self.ae(g.image_for_client_id(1)['extra_frames'], ())
+        self.ae(li(b'abcd', s=1, v=1, f=32, a='t').code, 'OK')
+        unsupported(li(b'abcd', s=2, v=2, f=8, a='f'))
+
+        # Render data
+        cw, ch = 10, 20
+        s, dx, dy, put_image, put_ref, layers, rect_eq = put_helpers(self, cw, ch)
+        self.ae(put_image(s, 10, 20, id=1)[1], 'OK')
+        self.ae(parse_response(send_command(s, 'a=T,f=16,i=2,s=2,v=2,z=-1', b'\x01\xff' * 4)), 'OK')
+        self.ae(parse_response(send_command(s, 'a=T,f=8,i=3,s=2,v=2,z=1', b'\xf8' * 4)), 'OK')
+        self.ae(tuple((x['image_id'], x['indexed_px_sz']) for x in layers(s)), ((2, 2), (1, 0), (3, 1)))
+        self.ae(s.grman.image_count, 3)
+
+        # Refs drawn at natural size use a cheaper program, so must not share
+        # a group with scaled refs of the same image
+        s, dx, dy, put_image, put_ref, layers, rect_eq = put_helpers(self, cw, ch)
+        self.ae(parse_response(send_command(s, 'a=T,f=8,i=1,s=2,v=2', b'\x01' * 4)), 'OK')
+        self.ae(parse_response(send_command(s, 'a=p,i=1,c=1,r=1')), 'OK')
+        self.ae(parse_response(send_command(s, 'a=p,i=1')), 'OK')
+        self.ae(parse_response(send_command(s, 'a=T,f=32,i=2,s=2,v=2', b'abcd' * 4)), 'OK')
+        self.ae(tuple((x['is_unscaled'], x['group_count']) for x in layers(s)), ((True, 1), (False, 1), (True, 1), (False, 1)))
 
     def test_image_parents(self):
         cw, ch = 10, 20
@@ -1359,6 +1454,153 @@ class TestGraphics(BaseTest):
         s.reverse_index()
         s.update_only_line_graphics_data()
         self.ae(ref_rows(scroll_view(6, True)), before)
+
+    def test_image_layers_with_paused_rendering(self):
+        # While rendering is paused, images are drawn from a frozen copy of the
+        # graphics manager, so they must be positioned using the scroll state
+        # captured with the frozen text, not the live one, otherwise output
+        # received during the pause shifts them relative to the text.
+        cw, ch = 10, 20
+
+        def screen(pixel_scroll=False, lines=5, before=10, after=20):
+            s = self.create_screen(10, lines, scrollback=50, cell_width=cw, cell_height=ch, options={'pixel_scroll': pixel_scroll})
+            for i in range(before):
+                parse_bytes(s, f'row{i:03d}\r\n'.encode())
+            # The image is placed in the cell just after the text IMG
+            s.draw('IMG')
+            send_command(s, 'a=T,f=24,i=1,s=10,v=20,c=1,r=1,C=1,q=2', b'x' * 10 * 20 * 3)
+            s.carriage_return(), s.linefeed()
+            for i in range(after):
+                parse_bytes(s, f'row{i + before:03d}\r\n'.encode())
+            return s
+
+        def dy(s):
+            return 2 / s.lines
+
+        def live_layers(s):
+            offset = s.pixel_scroll_offset_y / ch if s.pixel_scroll_offset_y else 0
+            return s.grman.update_layers(s.scrolled_by, -1, 1, 2 / s.columns, dy(s), s.columns, s.lines, cw, ch, offset)
+
+        def image_rows(s, layers):
+            offset = s.rendered_scroll_state()[1] / ch
+            return [round((1 - r['dest_rect']['top']) / dy(s) - offset) for r in layers]
+
+        def text_row(s):
+            for y in range(s.lines):
+                if str(s.visual_line(y)).startswith('IMG'):
+                    return y
+
+        def assert_layers_close(a, b):
+            # Positions computed from different scroll states differ by float rounding
+            self.ae(len(a), len(b))
+            for x, y in zip(a, b):
+                self.ae({k: v for k, v in x.items() if k != 'dest_rect'}, {k: v for k, v in y.items() if k != 'dest_rect'})
+                for side in ('left', 'top', 'right', 'bottom'):
+                    self.assertAlmostEqual(x['dest_rect'][side], y['dest_rect'][side], places=5)
+
+        def assert_aligned(s, layers, msg=''):
+            row = text_row(s)
+            self.assertIsNotNone(row, msg)
+            self.ae(image_rows(s, layers), [row], msg)
+
+        # Not paused: matches positioning with the live scroll state
+        for scrolled_by in (0, 5, 16, 17, 19, 21, 22):
+            s = screen()
+            s.scroll(scrolled_by, True)
+            self.ae(s.scrolled_by, scrolled_by)
+            layers = s.update_graphics_layers()
+            self.ae(layers, live_layers(s))
+            if 17 <= scrolled_by <= 21:
+                assert_aligned(s, layers, f'not paused, scrolled by {scrolled_by}')
+            else:
+                self.ae(layers, ())  # image is not visible
+
+        # Output arriving while paused and scrolled back
+        for num_new in (1, 3, 4, 10):
+            with self.subTest(num_new=num_new):
+                s = screen()
+                s.scroll(19, True)
+                before = s.update_graphics_layers()
+                self.ae(len(before), 1)
+                assert_aligned(s, before, 'before pause')
+                parse_bytes(s, b'\x1b[?2026h')
+                for i in range(num_new):
+                    parse_bytes(s, f'new{i}\r\n'.encode())
+                self.ae(s.scrolled_by, 19 + num_new)
+                during = s.update_graphics_layers()
+                self.ae(during, before)
+                assert_aligned(s, during, 'during pause')
+                parse_bytes(s, b'\x1b[?2026l')
+                after = s.update_graphics_layers()
+                self.ae(after, live_layers(s))
+                assert_aligned(s, after, 'after pause')
+                assert_layers_close(after, before)  # the view is anchored on the same content
+
+        # Several synchronized updates before the end of the pause
+        s = screen()
+        s.scroll(19, True)
+        before = s.update_graphics_layers()
+        parse_bytes(s, b'\x1b[?2026hnew\r\n\x1b[?2026l\x1b[?2026hmore\r\n')
+        self.ae(s.scrolled_by, 21)
+        assert_layers_close(s.update_graphics_layers(), before)  # the second pause re-snapshots from a different scroll state
+        self.assertTrue(s.pause_rendering(False))
+        assert_aligned(s, s.update_graphics_layers(), 'after consecutive updates')
+
+        # Pixel scrolling: the fractional line offset is also frozen
+        for position in (18.5, 19.25):
+            with self.subTest(position=position):
+                s = screen(pixel_scroll=True)
+                s.scroll_to_absolute(position)
+                self.assertNotEqual(s.pixel_scroll_offset_y, 0)
+                before = s.update_graphics_layers()
+                self.ae(before, live_layers(s))
+                self.ae(len(before), 1)
+                parse_bytes(s, b'\x1b[?2026h')
+                for i in range(3):
+                    parse_bytes(s, f'new{i}\r\n'.encode())
+                self.ae(s.update_graphics_layers(), before)
+                parse_bytes(s, b'\x1b[?2026l')
+                after = s.update_graphics_layers()
+                self.ae(after, live_layers(s))
+                assert_layers_close(after, before)  # the view is anchored on the same content
+
+        # Paused at the bottom: output scrolls the live image up, the frozen one stays
+        s = screen(before=2, after=1)
+        self.ae(s.scrolled_by, 0)
+        before = s.update_graphics_layers()
+        assert_aligned(s, before, 'at bottom')
+        parse_bytes(s, b'\x1b[?2026h')
+        for i in range(2):
+            parse_bytes(s, f'new{i}\r\n'.encode())
+        self.ae(s.scrolled_by, 0)
+        self.ae(s.update_graphics_layers(), before)
+        self.assertNotEqual(live_layers(s), before)
+        parse_bytes(s, b'\x1b[?2026l')
+        after = s.update_graphics_layers()
+        self.ae(image_rows(s, after), [r - 2 for r in image_rows(s, before)])
+        assert_aligned(s, after, 'at bottom after pause')
+
+        # Filling from the scrollback during the pause moves the live view to the bottom
+        s = screen(after=4)
+        s.scroll(1, True)
+        self.ae(s.scrolled_by, 1)
+        before = s.update_graphics_layers()
+        self.ae(len(before), 1)
+        parse_bytes(s, b'\x1b[?2026h\x1b[+T')
+        self.ae(s.scrolled_by, 0)
+        self.ae(s.update_graphics_layers(), before)
+        self.assertTrue(s.pause_rendering(False))
+        self.ae(s.update_graphics_layers(), live_layers(s))
+
+        # Images deleted during the pause remain in the frozen frame
+        s = screen()
+        s.scroll(19, True)
+        before = s.update_graphics_layers()
+        parse_bytes(s, b'\x1b[?2026hnew\r\n')
+        send_command(s, 'a=d,d=I,i=1,q=2')
+        self.ae(s.update_graphics_layers(), before)
+        parse_bytes(s, b'\x1b[?2026l')
+        self.ae(s.update_graphics_layers(), ())
 
     def test_unicode_placeholders_history_fill(self):
         # Lines popped back from the history (CSI + T, or enlarging the window with

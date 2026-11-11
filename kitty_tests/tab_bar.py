@@ -195,7 +195,7 @@ class TestTabBar(BaseTest):
         self.ae(tb.tab_id_at(5, 110), 1)
         self.ae(tb.tab_id_at(5, 150), 2)
 
-    def vertical_tab_bar(self, num_tabs: int = 2, height: int = 160, **opts: object) -> TabBar:
+    def vertical_tab_bar(self, num_tabs: int = 2, height: int = 160, width: int = 120, **opts: object) -> TabBar:
         self.set_options(
             {
                 'tab_bar_edge': LEFT_EDGE,
@@ -204,8 +204,8 @@ class TestTabBar(BaseTest):
                 **opts,
             }
         )
-        central = region(120, 0, 400, height)
-        tab_bar = region(0, 0, 120, height)
+        central = region(width, 0, 400, height)
+        tab_bar = region(0, 0, width, height)
         with (
             patch('kitty.tab_bar.cell_size_for_window', return_value=(10, 20)),
             patch('kitty.tab_bar.viewport_for_window', return_value=(central, tab_bar, 400, height, 10, 20)),
@@ -220,6 +220,14 @@ class TestTabBar(BaseTest):
     def screen_lines(self, tb: TabBar) -> list[str]:
         s = tb.screen
         return [str(s.line(i)).rstrip() for i in range(s.lines)]
+
+    def test_vertical_tab_bar_narrow_powerline(self) -> None:
+        # A short title fits in a narrow vertical tab bar, since the separator
+        # is drawn in a column of its own
+        sep = powerline_symbols['round'][0]
+        tb = self.vertical_tab_bar(width=40, tab_bar_style='powerline', tab_powerline_style='round', tab_title_template='{index}', tab_title_max_length=1)
+        self.ae(tb.screen.columns, 4)
+        self.ae(self.screen_lines(tb)[:3], [f' 1 {sep}', '', f' 2 {sep}'])
 
     def test_vertical_tab_bar_multiline_titles(self) -> None:
         # newlines are ignored unless tab_title_max_lines allows them, and the
@@ -277,17 +285,34 @@ class TestTabBar(BaseTest):
 
     def test_vertical_tab_bar_tab_spacing(self) -> None:
         # a blank line is left between tabs while there is room for it, but not
-        # above the first tab, and the gaps are not part of any tab's extent so
-        # clicking one activates nothing
+        # above the first tab. The gaps are not part of any tab's drawn extent,
+        # but for clicks the gap after a tab belongs to that tab.
         tb = self.vertical_tab_bar(num_tabs=3)
         self.ae(self.screen_lines(tb)[:6], ['t0', '', 't1', '', 't2', ''])
         self.ae(tuple(te.y for te in tb.tab_extents), (CellRange(0, 0), CellRange(2, 2), CellRange(4, 4)))
         self.ae(tb.tab_id_at(5, 10), 1)
-        self.ae(tb.tab_id_at(5, 30), 0)
+        self.ae(tb.tab_id_at(5, 30), 1)
         self.ae(tb.tab_id_at(5, 50), 2)
+        self.ae(tb.tab_id_at(5, 90), 3)
+        self.ae(tb.tab_id_at(5, 110), 3)
+        self.ae(tb.tab_id_at(5, 130), 0)
 
         # the gap uses the tab bar background, not the neighbouring tab's
         self.ae(int(tb.screen.line(1).cursor_from(0).bg), 0)
+
+        # the gap above the new tab button belongs to the tab above it, while
+        # the line below the button is empty tab bar space
+        tb = self.vertical_tab_bar(num_tabs=2)
+        with patch('kitty.tab_bar.update_tab_bar_edge_colors', return_value=None), patch('kitty.tab_bar.get_boss', return_value=DummyBoss()):
+            tb.update(tuple(tb.last_laid_out_tabs) + (TabBarData(title='+'),))
+        self.ae(tuple(te.tab_id for te in tb.tab_extents)[:2], (1, 2))
+        self.ae(tb.tab_id_at(5, 70), 2)
+        self.assertLess(tb.tab_id_at(5, 90), 0)
+        self.ae(tb.tab_id_at(5, 110), 0)
+
+        # no gaps, no extra hit area
+        tb = self.vertical_tab_bar(num_tabs=8, height=160)
+        self.ae(tb.tab_id_at(5, 150), 8)
 
         # spacing applies between multi-line tabs too
         tb = self.vertical_tab_bar(num_tabs=2, tab_title_max_lines=2, tab_title_template='{title}\\nbr')

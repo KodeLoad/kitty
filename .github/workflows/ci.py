@@ -160,10 +160,7 @@ def install_deps() -> None:
     if is_bundle:
         install_bundle()
     else:
-        cmd = 'python3 -m pip install Pillow pygments'
-        if sys.version_info[:2] < (3, 7):
-            cmd += ' importlib-resources dataclasses'
-        run(cmd)
+        run('python3 -m pip install Pillow pygments')
         install_slang_compiler()
     install_fonts()
 
@@ -291,6 +288,8 @@ IGNORED_DEPENDENCY_CVES = [
     'CVE-2026-15310',  # DoS in unzip
     'CVE-2026-87910',  # tarfile extract on systems without links irrelevant
     'CVE-2026-12345',  # tempfile.TemporaryDirectory cleanup symlink attack
+    'CVE-2026-103995',  # http response header parsing in stdlib, inapplicable
+    'CVE-2026-116566',  # getaddrinfo null bytes, utterly irrelevant
     # github.com/nwaples/rardecode/v2
     'CVE-2025-11579',  # rardecode is version 2.2.1, not vulnerable
 ]

@@ -121,9 +121,11 @@ typedef struct _GLFWWaylandBufferPair {
     struct {
         uint8_t *a, *b, *front, *back;
     } data;
+    // The back buffer could not be rendered into as it was busy
     bool has_pending_update;
     size_t size_in_bytes, width, height, viewport_width, viewport_height, stride;
-    bool a_needs_to_be_destroyed, b_needs_to_be_destroyed;
+    // Busy means attached to a surface and not yet released by the compositor
+    bool a_busy, b_busy;
 } _GLFWWaylandBufferPair;
 
 typedef struct _GLFWWaylandCSDSurface {
@@ -241,7 +243,8 @@ typedef struct _GLFWwindowWayland {
     } pointerLock;
 
     struct {
-        bool serverSide, buffer_destroyed, titlebar_needs_update, dragging, titlebar_hidden;
+        int pressed_button; // a GLFWTitlebarButton
+        bool serverSide, titlebar_needs_update, dragging, titlebar_hidden;
         _GLFWCSDSurface focus;
 
         _GLFWWaylandCSDSurface titlebar, shadow_left, shadow_right, shadow_top, shadow_bottom, shadow_upper_left, shadow_upper_right, shadow_lower_left,
@@ -394,6 +397,13 @@ typedef struct _GLFWlibraryWayland {
     struct zwp_pointer_gestures_v1 *pointer_gestures;
     struct zwp_pointer_gesture_hold_v1 *pointer_gesture_hold;
     struct zxdg_output_manager_v1 *xdg_output_manager;
+    // Outputs that have been bound but not yet announced to GLFW via
+    // wl_output.done. They are not in _glfw.monitors yet but must still be
+    // freed if their global is removed before the done event arrives.
+    struct {
+        _GLFWmonitor **array;
+        int count;
+    } pending_monitors;
     struct zwlr_virtual_pointer_manager_v1 *virtual_pointer_manager;
     struct zwlr_virtual_pointer_v1 *virtual_pointer;
     struct zwp_virtual_keyboard_manager_v1 *virtual_keyboard_manager;
@@ -516,6 +526,10 @@ typedef struct _GLFWmonitorWayland {
     double fractional_scale;
     bool xdg_size_received;
     bool xdg_position_received;
+    // Set once we have given up waiting for xdg_output geometry for this
+    // monitor, so that we dont block repeatedly on a compositor that never
+    // sends it.
+    bool xdg_geometry_wait_abandoned;
 
 } _GLFWmonitorWayland;
 
@@ -536,6 +550,9 @@ typedef struct _GLFWcursorWayland {
 
 void _glfwAddOutputWayland(uint32_t name, uint32_t version);
 void _glfwCreateXdgOutputWayland(_GLFWmonitor *monitor);
+bool _glfwRemoveOutputWayland(uint32_t name);
+void _glfwFreePendingOutputsWayland(void);
+void _glfwCreateXdgOutputsWayland(void);
 void _glfwWaylandBeforeBufferSwap(_GLFWwindow *window);
 void _glfwWaylandAfterBufferSwap(_GLFWwindow *window);
 void _glfwWaylandSurfaceOutputsChanged(_GLFWwindow *window);

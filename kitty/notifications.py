@@ -12,7 +12,16 @@ from itertools import count
 from typing import Any, NamedTuple, Set
 from weakref import ReferenceType, ref
 
-from .constants import cache_dir, config_dir, is_macos, logo_png_file, standard_icon_names, standard_sound_names, supports_window_occlusion
+from .constants import (
+    cache_dir,
+    config_dir,
+    config_dir_files_ignored,
+    is_macos,
+    logo_png_file,
+    standard_icon_names,
+    standard_sound_names,
+    supports_window_occlusion,
+)
 from .fast_data_types import (
     ESC_OSC,
     StreamingBase64Decoder,
@@ -528,6 +537,9 @@ class MacOSIntegration(DesktopIntegration):
         from .fast_data_types import cocoa_set_notification_activated_callback
 
         self.id_counter = count(start=1)
+        # All kitty instances share a single notification center, so
+        # namespace our notification identifiers with our pid
+        self.ident_prefix = f'{os.getpid()}-'
         self.live_notification_queries: list[tuple[int, str]] = []
         self.failed_icons: OrderedDict[str, bool] = OrderedDict()
         self.icd_key_prefix = os.urandom(16).hex()
@@ -537,6 +549,17 @@ class MacOSIntegration(DesktopIntegration):
         self.default_category = MacOSNotificationCategory('1')
         self.current_categories: frozenset[MacOSNotificationCategory] = frozenset()
         cocoa_set_notification_activated_callback(self.notification_activated)
+
+    def to_ident(self, desktop_notification_id: int) -> str:
+        return f'{self.ident_prefix}{desktop_notification_id}'
+
+    def from_ident(self, ident: str) -> int | None:
+        if ident.startswith(self.ident_prefix):
+            try:
+                return int(ident[len(self.ident_prefix) :])
+            except Exception:
+                pass
+        return None
 
     def query_live_notifications(self, channel_id: int, identifier: str) -> None:
         from .fast_data_types import cocoa_live_delivered_notifications
@@ -549,7 +572,7 @@ class MacOSIntegration(DesktopIntegration):
     def close_notification(self, desktop_notification_id: int) -> bool:
         from .fast_data_types import cocoa_remove_delivered_notification
 
-        close_succeeded = cocoa_remove_delivered_notification(str(desktop_notification_id))
+        close_succeeded = cocoa_remove_delivered_notification(self.to_ident(desktop_notification_id))
         if debug_desktop_integration:
             log_error(f'Close request for {desktop_notification_id=} {"succeeded" if close_succeeded else "failed"}')
         return close_succeeded
@@ -623,7 +646,7 @@ class MacOSIntegration(DesktopIntegration):
 
         cocoa_send_notification(
             nc.application_name or 'kitty',
-            str(desktop_notification_id),
+            self.to_ident(desktop_notification_id),
             nc.title,
             body,
             category=category,
@@ -636,7 +659,7 @@ class MacOSIntegration(DesktopIntegration):
 
     def notification_activated(self, event: str, ident: str, button_id: str) -> None:
         if event == 'live':
-            live_ids = tuple(int(x) for x in ident.split(',') if x)
+            live_ids = tuple(x for x in map(self.from_ident, ident.split(',')) if x is not None)
             if debug_desktop_integration:
                 log_error(f'Live notifications: {live_ids}')
             self.notification_manager.purge_dead_notifications(live_ids)
@@ -646,9 +669,8 @@ class MacOSIntegration(DesktopIntegration):
             return
         if debug_desktop_integration:
             log_error(f'Notification {ident=} {event=} {button_id=}')
-        try:
-            desktop_notification_id = int(ident)
-        except Exception:
+        desktop_notification_id = self.from_ident(ident)
+        if desktop_notification_id is None:
             log_error(f'Got unexpected notification activated event with id: {ident!r} from cocoa')
             return
         if event == 'created':
@@ -699,6 +721,9 @@ class FreeDesktopIntegration(DesktopIntegration):
         # desktop_notification_id we use for the notification
         self.dbus_to_desktop: 'OrderedDict[int, int]' = OrderedDict()
         self.desktop_to_dbus: dict[int, int] = {}
+        # notifications for which a close was requested before the
+        # notification daemon replied with the dbus id
+        self.pending_closes: set[int] = set()
 
     def query_live_notifications(self, channel_id: int, identifier: str) -> None:
         self.notification_manager.send_live_response(channel_id, identifier, tuple(self.desktop_to_dbus))
@@ -711,7 +736,22 @@ class FreeDesktopIntegration(DesktopIntegration):
             close_succeeded = dbus_close_notification(dbus_id)
             if debug_desktop_integration:
                 log_error(f'Close request for {desktop_notification_id=} {"succeeded" if close_succeeded else "failed"}')
+        else:
+            close_succeeded = self.defer_close_till_created(desktop_notification_id)
         return close_succeeded
+
+    def defer_close_till_created(self, desktop_notification_id: int) -> bool:
+        # If the notification daemon has not yet replied to Notify, close the
+        # notification once it does
+        n = self.notification_manager.in_progress_notification_commands.get(desktop_notification_id)
+        if n is None or n.created_by_desktop:
+            return False
+        if len(self.pending_closes) > 128:
+            self.pending_closes &= set(self.notification_manager.in_progress_notification_commands)
+        self.pending_closes.add(desktop_notification_id)
+        if debug_desktop_integration:
+            log_error(f'Close request for {desktop_notification_id=} deferred till notification is created')
+        return True
 
     def get_desktop_notification_id(self, dbus_notification_id: int, event: str) -> int | None:
         q = self.dbus_to_desktop.get(dbus_notification_id)
@@ -727,13 +767,23 @@ class FreeDesktopIntegration(DesktopIntegration):
                 log_error(f'Could not find dbus_notification_id for {desktop_notification_id=} for event {event}')
         return q
 
-    def created(self, dbus_notification_id: int, desktop_notification_id: int) -> None:
-        self.dbus_to_desktop[desktop_notification_id] = dbus_notification_id
-        self.desktop_to_dbus[dbus_notification_id] = desktop_notification_id
+    def created(self, desktop_notification_id: int, dbus_notification_id: int) -> None:
+        self.dbus_to_desktop[dbus_notification_id] = desktop_notification_id
+        self.desktop_to_dbus[desktop_notification_id] = dbus_notification_id
         if len(self.dbus_to_desktop) > 128:
             k, v = self.dbus_to_desktop.popitem(False)
             self.desktop_to_dbus.pop(v, None)
-        if n := self.notification_manager.notification_created(dbus_notification_id):
+        if desktop_notification_id in self.pending_closes:
+            self.pending_closes.discard(desktop_notification_id)
+            from .fast_data_types import dbus_close_notification
+
+            close_succeeded = dbus_close_notification(dbus_notification_id)
+            if debug_desktop_integration:
+                log_error(f'Deferred close request for {desktop_notification_id=} {"succeeded" if close_succeeded else "failed"}')
+            if not close_succeeded:
+                self.notification_manager.notification_closed(desktop_notification_id)
+            return
+        if n := self.notification_manager.notification_created(desktop_notification_id):
             # self.supports_sound does not tell us if the notification server
             # supports named sounds or not so we play the named sound
             # ourselves and tell the server to mute any sound it might play.
@@ -756,6 +806,7 @@ class FreeDesktopIntegration(DesktopIntegration):
         if debug_desktop_integration:
             log_error(f'Got notification event from desktop: {event_type=} {dbus_notification_id=} {extra=}')
         if event_type == 'created':
+            # for this event the first argument is the desktop_notification_id and extra is the dbus id
             self.created(dbus_notification_id, int(extra))
             return
         if desktop_notification_id := self.get_desktop_notification_id(dbus_notification_id, event_type):
@@ -769,7 +820,7 @@ class FreeDesktopIntegration(DesktopIntegration):
 
     def notify(self, nc: NotificationCommand, existing_desktop_notification_id: int | None) -> int:
         from .fast_data_types import dbus_send_notification
-        from .xdg import icon_exists, icon_for_appname
+        from .xdg import icon_exists, icon_for_appname, kitty_desktop_entry
 
         app_icon = ''
         if nc.icon_names:
@@ -794,6 +845,10 @@ class FreeDesktopIntegration(DesktopIntegration):
         replaces_dbus_id = 0
         if existing_desktop_notification_id:
             replaces_dbus_id = self.get_dbus_notification_id(existing_desktop_notification_id, 'notify') or 0
+            if not replaces_dbus_id:
+                # The notification being replaced has not been created yet so
+                # it cannot be replaced, instead close it once it is created
+                self.defer_close_till_created(existing_desktop_notification_id)
         actions = {'default': ''}
         for i, b in enumerate(nc.buttons):
             actions[str(i + 1)] = b
@@ -808,6 +863,10 @@ class FreeDesktopIntegration(DesktopIntegration):
             replaces=replaces_dbus_id,
             category=(nc.notification_types or ('',))[0],
             muted=nc.sound_name == 'silent' or nc.sound_name != 'system',
+            # Only claim the notification for kitty's desktop file when it
+            # does not come from some other named application, as notification
+            # servers prefer desktop-entry over app_name for grouping.
+            desktop_entry=kitty_desktop_entry() if nc.application_name in ('', 'kitty') else '',
         )
         if debug_desktop_integration:
             log_error(f'Requested creation of notification with {desktop_notification_id=}')
@@ -894,7 +953,7 @@ class NotificationManager:
         self.icon_data_cache = IconDataCache(base_cache_dir=self.base_cache_dir)
         script_path = os.path.join(config_dir, 'notifications.py')
         self.filter_script: Callable[[NotificationCommand], bool] = lambda nc: False
-        if os.path.exists(script_path):
+        if not config_dir_files_ignored() and os.path.exists(script_path):
             import runpy
 
             try:

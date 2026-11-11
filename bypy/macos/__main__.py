@@ -54,7 +54,7 @@ def flipwritable(fn, mode=None):
     return old_mode
 
 
-STRIPCMD = ('/usr/bin/strip', '-x', '-S', '-')
+STRIPCMD = ('/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/strip', '-x', '-S', '-')
 
 
 def strip_files(files, argv_max=(256 * 1024)) -> None:
@@ -514,11 +514,13 @@ class Freeze(object):
         os.symlink('/Applications', join(tdir, 'Applications'))
         size_in_mb = int(subprocess.check_output(['du', '-s', '-k', tdir]).decode('utf-8').split()[0]) / 1024.0
         cmd = ['/usr/bin/hdiutil', 'create', '-srcfolder', tdir, '-volname', volname, '-format', format]
-        if 190 < size_in_mb < 250:
-            # We need -size 255m because of a bug in hdiutil. When the size of
+        if size_in_mb > 190:
+            # We need an explicit -size because of a bug in hdiutil. When the size of
             # srcfolder is close to 200MB hdiutil fails with
             # diskimages-helper: resize request is above maximum size allowed.
-            cmd += ['-size', '255m']
+            # Leave headroom for filesystem overhead, otherwise hdiutil fails
+            # with No space left on device.
+            cmd += ['-size', f'{max(255, int(size_in_mb * 1.2) + 32)}m']
         print('\nCreating dmg...')
         with timeit() as times:
             subprocess.check_call(cmd + [dmg])
