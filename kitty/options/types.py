@@ -435,6 +435,9 @@ option_names = (
     'repaint_delay',
     'resize_debounce_time',
     'resize_in_steps',
+    'restore_last_session',
+    'restore_last_session_interval',
+    'restore_last_session_programs',
     'scrollback_fill_enlarged_window',
     'scrollback_lines',
     'scrollback_pager',
@@ -652,6 +655,9 @@ class Options:
     repaint_delay: int = 10
     resize_debounce_time: tuple[float, float] = (0.1, 0.5)
     resize_in_steps: bool = False
+    restore_last_session: bool = False
+    restore_last_session_interval: float = 30.0
+    restore_last_session_programs: frozenset[str] = frozenset({'btop', 'emacs', 'helix', 'htop', 'hx', 'less', 'man', 'micro', 'more', 'nano', 'nvim', 'ssh', 'top', 'vi', 'vim'})
     scrollback_fill_enlarged_window: bool = False
     scrollback_lines: int = 2000
     scrollback_pager: list[str] = ['less', '--chop-long-lines', '--RAW-CONTROL-CHARS', '+INPUT_LINE_NUMBER']

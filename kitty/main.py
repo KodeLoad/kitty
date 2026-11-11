@@ -308,10 +308,15 @@ def _run_app(opts: Options, args: CLIOptions, bad_lines: Sequence[BadLine] = (),
 
                 pos_x, pos_y = parse_os_window_position(args.position)
         startup_session_error: tuple[Exception, str] | None = None
+        default_session = opts.startup_session
+        from .session import last_session_path, should_restore_last_session
+
+        if should_restore_last_session(opts, args, lsp := last_session_path(), is_panel=_is_panel_kitten):
+            default_session = lsp
         try:
-            startup_sessions = tuple(create_sessions(opts, args, default_session=opts.startup_session))
+            startup_sessions = tuple(create_sessions(opts, args, default_session=default_session))
         except Exception as e:
-            startup_session_error = (e, (getattr(args, 'session', '') or opts.startup_session or ''))
+            startup_session_error = (e, (getattr(args, 'session', '') or default_session or ''))
             if getattr(args, 'session', ''):
                 args.session = ''
             startup_sessions = tuple(create_sessions(opts, args))
